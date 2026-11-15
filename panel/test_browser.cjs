@@ -962,10 +962,10 @@ async function main(){
   assert.equal(await evaluate('document.querySelector("#diagnostic-general-panel").hidden'),true);
   assert.equal(await evaluate('document.querySelector("#diagnostic-telegram-panel").hidden'),true);
   await until('document.querySelectorAll("#network-diagnostic-charts svg").length===6','Network graphs render measured data');
-  await evaluate('document.querySelector("[data-network-range=\"24\"]").click()');
+  await evaluate('Array.from(document.querySelectorAll("[data-network-range]")).find(button=>button.dataset.networkRange==="24").click()');
   assert.match(await evaluate('document.querySelector("#network-range-note").textContent'),/Минутные пики/);
   assert.match(await evaluate('document.querySelectorAll(".net-diag-chart")[1].textContent'),/41/);
-  await evaluate('document.querySelector("[data-network-range=\"8\"]").click()');
+  await evaluate('Array.from(document.querySelectorAll("[data-network-range]")).find(button=>button.dataset.networkRange==="8").click()');
   assert.match(await evaluate('document.querySelectorAll(".net-diag-chart")[1].textContent'),/32/);
   await evaluate('document.querySelector("#network-diagnostic-capture").click()');
   await until('document.querySelector("#network-capture-status").textContent.includes("Отметка сохранена")',
