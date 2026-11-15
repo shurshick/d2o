@@ -146,14 +146,14 @@
         <nav class="diag-tabs" role="tablist" aria-label="Раздел диагностики">
           <button type="button" role="tab" id="diagnostic-general-tab" aria-selected="true" aria-controls="diagnostic-general-panel" data-diagnostic-tab="general">Общая</button>
           <button type="button" role="tab" id="diagnostic-telegram-tab" aria-selected="false" aria-controls="diagnostic-telegram-panel" data-diagnostic-tab="telegram">Telegram</button>
+          <button type="button" role="tab" id="diagnostic-network-tab" aria-selected="false" aria-controls="diagnostic-network-panel" data-diagnostic-tab="network" tabindex="-1">Сеть</button>
         </nav>
         <div id="diagnostic-general-panel" class="diag-tab-panel" role="tabpanel" aria-labelledby="diagnostic-general-tab" data-diagnostic-panel="general">
         <section class="diag-history" aria-labelledby="diagnostic-history-title">
           <div class="diag-history-head">
             <div><h3 id="diagnostic-history-title">Память и подборы</h3><p>Локальная история работы движка</p></div>
             <span class="diag-collection-state" id="diagnostic-state">Проверяем…</span>
-            <button type="button" role="tab" id="diagnostic-network-tab" aria-selected="false" aria-controls="diagnostic-network-panel" data-diagnostic-tab="network" tabindex="-1">Сеть</button>
-        </div>
+          </div>
           <p id="diagnostic-status" class="diag-history-note" role="status">Проверяем состояние сбора…</p>
           <div id="diagnostic-data" class="diag-history-data" hidden>
             <section class="diag-card diag-memory-panel" aria-labelledby="diagnostic-memory-title">
@@ -428,22 +428,22 @@
               <details class="diag-history-help"><summary>Что сохраняется</summary><p>Диагностика сохраняет снимок прокси раз в минуту. В течение суток сохраняются память процесса, известные выделения, буферные лимиты, соединения и ошибки; в отчёт также попадает последний полный срез с маршрутами и активными сессиями. Сбор выключен по умолчанию и не меняет настройки прокси. Данные остаются локально. Перед отправкой отчёта проверьте его содержимое.</p></details>
             </div>
           </section>
-          <section id="diagnostic-network-panel" class="diag-tab-panel" role="tabpanel" aria-labelledby="diagnostic-network-tab" data-diagnostic-panel="network" hidden>
-            <div class="diag-card">
-              <h4>Сетевая диагностика</h4>
-              <p id="network-diagnostic-status" role="status"></p>
-              <div class="diag-history-actions">
-                <button type="button" class="btn" id="network-diagnostic-toggle" role="switch" aria-label="Сетевая диагностика" aria-checked="false">Включить сбор</button>
-                <a class="btn" id="network-diagnostic-download" href="/api/diagnostics?network-download" download="d2k-network-diagnostics.json" hidden>Скачать сетевой отчёт</a>
-              </div>
-              <h4>Зафиксированные инциденты</h4>
-              <div id="network-diagnostic-incidents"></div>
-              <details class="diag-history-help"><summary>Что сохраняется</summary>
-                <p>Минутные сводки хранятся до 24 часов, подробные замеры за последние 8 минут — каждые 2 секунды. Для трёх последних инцидентов сохраняется до 5 минут до сигнала и до 3 минут после. История очищается при выключении сбора или перезапуске диагностики.</p>
-              </details>
-            </div>
-          </section>
         </div>
+        <section id="diagnostic-network-panel" class="diag-tab-panel" role="tabpanel" aria-labelledby="diagnostic-network-tab" data-diagnostic-panel="network" hidden>
+          <div class="diag-card">
+            <h4>Сетевая диагностика</h4>
+            <p id="network-diagnostic-status" role="status"></p>
+            <div class="diag-history-actions">
+              <button type="button" class="btn" id="network-diagnostic-toggle" role="switch" aria-label="Сетевая диагностика" aria-checked="false">Включить сбор</button>
+              <a class="btn" id="network-diagnostic-download" href="/api/diagnostics?network-download" download="d2k-network-diagnostics.json" hidden>Скачать сетевой отчёт</a>
+            </div>
+            <h4>Зафиксированные инциденты</h4>
+            <div id="network-diagnostic-incidents"></div>
+            <details class="diag-history-help"><summary>Что сохраняется</summary>
+              <p>Минутные сводки хранятся до 24 часов, подробные замеры за последние 8 минут — каждые 2 секунды. Для трёх последних инцидентов сохраняется до 5 минут до сигнала и до 3 минут после. История очищается при выключении сбора или перезапуске диагностики.</p>
+            </details>
+          </div>
+        </section>
         <div class="diag-history-footer diag-shared-footer">
           <a class="btn" data-variant="primary" id="diagnostic-download" href="/api/diagnostics?download" download="d2k-diagnostics.json" hidden>Скачать общий отчёт</a>
         </div>

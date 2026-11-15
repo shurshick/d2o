@@ -932,6 +932,16 @@ async function main(){
   assert.match(await evaluate('document.querySelector("#diagnostic-aimd-current").textContent'),/1\/1.*память, conntrack/,'current 1/1 limiter and its causes are shown');
   assert.match(await evaluate('document.querySelector("#diagnostic-aimd-history").textContent'),/1 \/ 1.*память/,'AIMD transition history includes the 1/1 cause');
   assert.equal(await evaluate('document.querySelector("#diagnostic-download").getAttribute("href")'),'/api/diagnostics?download','the complete JSON download endpoint stays linked');
+  assert.deepEqual(await evaluate('Array.from(document.querySelectorAll(".diag-tabs > [role=tab]"),tab=>tab.dataset.diagnosticTab)'),
+   ['general','telegram','network'],'Network shares the diagnostics tab bar');
+  await evaluate('document.querySelector("#diagnostic-network-tab").click()');
+  await until('document.querySelector("#diagnostic-network-panel").getClientRects().length > 0 && document.querySelector("#network-diagnostic-toggle").getClientRects().length > 0',
+   'Network diagnostics remain visible after selecting their tab');
+  assert.equal(await evaluate('document.querySelector("#diagnostic-general-panel").hidden'),true);
+  assert.equal(await evaluate('document.querySelector("#diagnostic-telegram-panel").hidden'),true);
+  await evaluate('document.querySelector("#diagnostic-general-tab").click()');
+  assert.equal(await evaluate('document.querySelector("#diagnostic-data").getClientRects().length > 0'),true,
+   'general diagnostics can be reopened after visiting Network');
   await evaluate('document.querySelector("#diagnostic-telegram-tab").click()');
   await until('document.querySelector("#telegram-diagnostic-memory-chart")?.dataset.points==="3"','Telegram memory history renders in its tab');
   assert.equal(await evaluate('document.querySelector("#telegram-diagnostic-traffic-chart").dataset.points'),'3','Telegram throughput history uses the same time range');
