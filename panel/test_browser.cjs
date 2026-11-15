@@ -975,8 +975,16 @@ async function main(){
   assert.match(await evaluate('document.querySelector("#network-diagnostic-incidents").textContent'),/Отметка пользователя/);
   for(const width of [320,390]){
    await call('Emulation.setDeviceMetricsOverride',{width,height:844,deviceScaleFactor:1,mobile:true});
-   await until('innerWidth==='+width,'Network tab uses the emulated viewport');
-   assert.equal(await evaluate('document.documentElement.scrollWidth>innerWidth'),false,'Network fits '+width+'px with incident details open');
+   await until('getComputedStyle(document.querySelector("#network-diagnostic-charts")).gridTemplateColumns.split(" ").length===1',
+    'Network charts use one column on mobile');
+   const layout=await evaluate(`(()=>{
+    const panel=document.querySelector("#diagnostic-network-panel");
+    const scroller=panel.querySelector(".diag-table-scroll");
+    return {right:panel.getBoundingClientRect().right,width:panel.clientWidth,scroll:panel.scrollWidth,
+     tableScroll:scroller.scrollWidth>scroller.clientWidth};
+   })()`);
+   assert.ok(layout.right<=width+1 && layout.scroll<=layout.width+1 && layout.tableScroll,
+    'Network fits '+width+'px with its incident table contained: '+JSON.stringify(layout));
   }
   await call('Emulation.setDeviceMetricsOverride',{width:1440,height:900,deviceScaleFactor:1,mobile:false});
   await evaluate('document.querySelector("#diagnostic-general-tab").click()');
