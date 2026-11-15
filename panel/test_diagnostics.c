@@ -10,8 +10,11 @@ static void test_network_export(void) {
  int sv[2]; assert(socketpair(AF_UNIX,SOCK_STREAM,0,sv)==0);
  const char *good="POST / HTTP/1.1\r\nHost: localhost\r\nOrigin: http://localhost\r\n\r\n";
  char response[8192];
- assert(api_diagnostics(sv[0],&cfg,good,"POST","network-enable")==0);
+ assert(api_diagnostics(sv[0],&cfg,good,"POST","network-capture")==0);
  ssize_t n=read(sv[1],response,sizeof(response)-1); assert(n>0); response[n]=0;
+ assert(strstr(response,"409 Conflict"));
+ assert(api_diagnostics(sv[0],&cfg,good,"POST","network-enable")==0);
+ n=read(sv[1],response,sizeof(response)-1); assert(n>0); response[n]=0;
  assert(strstr(response,"\"enabled\":false,\"telegram_enabled\":false,\"network_enabled\":true"));
  assert(api_diagnostics(sv[0],&cfg,good,"GET","network-report")==0);
  n=read(sv[1],response,sizeof(response)-1); assert(n>0); response[n]=0;
@@ -19,7 +22,7 @@ static void test_network_export(void) {
  int state=d2k_network_open(dir,D2K_NETWORK_STATE,1);
  assert(state>=0 && !flock(state,LOCK_EX|LOCK_NB));
  d2k_network_history *history=d2k_network_history_map(state,d2k_network_session(dir)); assert(history);
- d2k_network_history_sample(history,1000,&(d2k_network_controller_message){0},
+ d2k_network_history_sample(history,(uint64_t)monotonic_ms(),&(d2k_network_controller_message){0},
     &(d2k_network_datapath_message){0},"/nonexistent","/nonexistent","/nonexistent");
  assert(!flock(state,LOCK_UN));
 
@@ -40,6 +43,12 @@ static void test_network_export(void) {
  close(sv[0]); close(sv[1]);
 
  assert(socketpair(AF_UNIX,SOCK_STREAM,0,sv)==0);
+ assert(api_diagnostics(sv[0],&cfg,"POST / HTTP/1.1\r\nHost: localhost\r\n\r\n","POST","network-capture")==0);
+ n=read(sv[1],response,sizeof(response)-1); assert(n>0); response[n]=0;
+ assert(strstr(response,"403 Forbidden"));
+ assert(api_diagnostics(sv[0],&cfg,good,"POST","network-capture")==0);
+ n=read(sv[1],response,sizeof(response)-1); assert(n>0); response[n]=0;
+ assert(strstr(response,"202 Accepted"));
  assert(!d2k_diag_toggle(dir,1));
  assert(api_diagnostics(sv[0],&cfg,good,"POST","network-disable")==0);
  n=read(sv[1],response,sizeof(response)-1); assert(n>0); response[n]=0;

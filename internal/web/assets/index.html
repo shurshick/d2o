@@ -430,19 +430,43 @@
           </section>
         </div>
         <section id="diagnostic-network-panel" class="diag-tab-panel" role="tabpanel" aria-labelledby="diagnostic-network-tab" data-diagnostic-panel="network" hidden>
-          <div class="diag-card">
-            <h4>Сетевая диагностика</h4>
-            <p id="network-diagnostic-status" role="status"></p>
+          <header class="net-diag-header">
+            <div>
+              <h3>Сетевая диагностика</h3>
+              <p id="network-diagnostic-status" role="status"></p>
+            </div>
             <div class="diag-history-actions">
               <button type="button" class="btn" id="network-diagnostic-toggle" role="switch" aria-label="Сетевая диагностика" aria-checked="false">Включить сбор</button>
-              <a class="btn" id="network-diagnostic-download" href="/api/diagnostics?network-download" download="d2k-network-diagnostics.json" hidden>Скачать сетевой отчёт</a>
+              <button type="button" class="btn" data-variant="primary" id="network-diagnostic-capture" disabled>Зафиксировать сбой</button>
+              <a class="btn" id="network-diagnostic-download" href="/api/diagnostics?network-download" download="d2k-network-diagnostics.json" hidden>Скачать JSON</a>
             </div>
-            <h4>Зафиксированные инциденты</h4>
-            <div id="network-diagnostic-incidents"></div>
-            <details class="diag-history-help"><summary>Что сохраняется</summary>
-              <p>Минутные сводки хранятся до 24 часов, подробные замеры за последние 8 минут — каждые 2 секунды. Для трёх последних инцидентов сохраняется до 5 минут до сигнала и до 3 минут после. История очищается при выключении сбора или перезапуске диагностики.</p>
-            </details>
+            <p class="diag-history-note" id="network-capture-status" role="status"></p>
+          </header>
+          <div id="network-diagnostic-data" hidden>
+            <div class="net-diag-overview" id="network-diagnostic-overview"></div>
+            <div class="net-diag-toolbar">
+              <div>
+                <h4>История показателей</h4>
+                <p class="diag-history-note" id="network-range-note"></p>
+              </div>
+              <div class="diag-range" role="group" aria-label="Период сетевых графиков">
+                <button type="button" data-network-range="8" aria-pressed="true">8 минут</button>
+                <button type="button" data-network-range="24" aria-pressed="false">24 часа</button>
+              </div>
+            </div>
+            <div class="net-diag-charts" id="network-diagnostic-charts"></div>
+            <section class="net-diag-events" aria-labelledby="network-events-title">
+              <h4 id="network-events-title">Инциденты</h4>
+              <div id="network-diagnostic-incidents"></div>
+              <details class="net-diag-anomalies" id="network-diagnostic-anomalies">
+                <summary>Аномалии за 24 часа</summary>
+                <div class="net-diag-anomaly-list" id="network-anomaly-list"></div>
+              </details>
+            </section>
           </div>
+          <details class="diag-history-help"><summary>Что сохраняется</summary>
+            <p>До 24 часов минутных сводок и 8 минут замеров с шагом 2 секунды. Для трёх последних инцидентов сохраняется до 5 минут перед сигналом и 3 минут после. Доступность оценивается по штатным проверкам D2O. История хранится в RAM и очищается при остановке сбора или перезапуске диагностики.</p>
+          </details>
         </section>
         <div class="diag-history-footer diag-shared-footer">
           <a class="btn" data-variant="primary" id="diagnostic-download" href="/api/diagnostics?download" download="d2k-diagnostics.json" hidden>Скачать общий отчёт</a>

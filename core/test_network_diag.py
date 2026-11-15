@@ -30,7 +30,9 @@ def main():
                 f"{'0'*32} 00 {'0'*32} 00 {'0'*32} ffffffff 1 0 00200201 lo\n"
             ),
             "run/d2k.pid": "22\n",
+            "run/d2kd.pid": "21\n",
             "proc/22/stat": "22 (d2kc) S " + "0 " * 10 + "20 10 " + "0 " * 6 + "7\n",
+            "proc/21/stat": "21 (d2kd) S " + "0 " * 10 + "10 10 " + "0 " * 6 + "6\n",
             "sys/class/net/wan0/ifindex": "9\n",
             "sys/class/net/wan0/operstate": "up\n",
             "sys/class/net/wan0/carrier": "1\n",
@@ -60,7 +62,7 @@ def main():
         assert q["kernel_packet_to_verdict_max_us"] == 99
         q = dict(zip(queue_fields, parsed[2]["nfqueue"], strict=True))
         assert q["kernel_packet_to_verdict_max_us"] is None  # same sender window
-        assert parsed[-1]["cpu_pct_one_core"] == [0, None, None, None, None]
+        assert parsed[-1]["cpu_pct_one_core"] == [0, 0, None, None, None]
         assert parsed[-1]["conntrack"] == [256, 4096, 17, 5, 3]
         assert parsed[-1]["wan4"] == [2, 9, 6, 1, None, None, None, 5]
         assert parsed[-1]["wan6"] == [0, None, None, None, None, None, None, None]
@@ -72,7 +74,7 @@ def main():
         (root / "proc/net/netfilter/nfnetlink_queue").unlink()
         (root / "proc/net/route").unlink()
         gaps = json.loads(subprocess.check_output(argv))
-        q = dict(zip(queue_fields, gaps["samples"][1][-2], strict=True))
+        q = dict(zip(queue_fields, gaps["samples"][1][6], strict=True))
         assert q["backlog"] is None and q["netlink_socket_drops"] is None
         assert gaps["samples"][1][4] == [None] * 8
         long_report = json.loads(subprocess.check_output([*argv, "long"]))
@@ -92,6 +94,28 @@ def main():
             assert len(e["samples"]) == 241
             assert e["trigger_ms"] - e["samples"][0][1] == 300000
             assert e["samples"][-1][1] - e["trigger_ms"] == 180000
+        queue = root / "proc/net/netfilter/nfnetlink_queue"
+        queue.write_text(fixture["proc/net/netfilter/nfnetlink_queue"])
+        anomalies = json.loads(subprocess.check_output([*argv, "anomalies"]))
+        by_signal = {name: 1 << i for i, name in enumerate(anomalies["incident_signals"])}
+        auto, manual = anomalies["incidents"]
+        assert auto["trigger_ms"] == 361000
+        expected = ("verdict_delay", "datapath_loop_gap", "queue_pressure", "timeout_burst",
+                    "datapath_telemetry_gap")
+        assert auto["signals"] == sum(by_signal[name] for name in expected)
+        assert manual["signals"] & by_signal["manual"]
+        assert manual["trigger_ms"] == anomalies["manual_captured_ms"] == 369000
+        assert not anomalies["manual_pending"]
+        for e in (auto, manual):
+            assert e["complete"] and len(e["samples"]) == 241
+        minute = next(row for row in anomalies["minutes"] if row[1] == 6)
+        assert minute[3] == auto["signals"] | by_signal["manual"]
+        mapped = dict(zip(anomalies["minute_fields"], minute, strict=True))
+        assert mapped["queue_peak"] == 800 and mapped["verdict_peak_us"] == 500000
+        deltas = dict(zip(anomalies["delta_fields"], mapped["deltas"], strict=True))
+        assert deltas["dns_valid_replies"] == deltas["direct_verified"] == 1
+        assert deltas["tcp_prior_exchange_actions"] == 2 and deltas["udp_prior_exchange_actions"] == 1
+        assert deltas["queue_drops"] == 0 and deltas["netlink_drops"] is None
     print("network diagnostics: history, procfs, missing sources and stale IPC OK")
 
 

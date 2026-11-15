@@ -1393,3 +1393,49 @@ body[data-stale="true"] main { opacity: .55; filter: saturate(.4); transition: o
   .diag-history-actions { width: 100%; }
   .diag-history-actions .btn { flex: 1 1 auto; }
 }
+
+/* Network diagnostics */
+.net-diag-header, .net-diag-toolbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  flex-wrap: wrap;
+  gap: 12px 20px;
+}
+.net-diag-header { padding: 20px 0; border-bottom: 1px solid var(--rule); }
+.net-diag-header h3 { font-size: 1.25rem; }
+.net-diag-header p { color: var(--ink-2); font-size: .8125rem; margin-top: 5px; }
+#network-capture-status { flex-basis: 100%; }
+#network-capture-status:empty { display: none; }
+.net-diag-overview, .net-diag-charts { display: grid; gap: 12px; }
+.net-diag-overview { grid-template-columns: repeat(3, minmax(0, 1fr)); margin: 18px 0 24px; }
+.net-diag-overview > div { min-width: 0; padding: 13px 15px; border: 1px solid var(--rule); border-radius: 10px; background: var(--paper-2); }
+.net-diag-overview strong { display: block; font-size: .82rem; margin-bottom: 4px; }
+.net-diag-overview p { margin: 0; }
+.net-diag-toolbar { margin-bottom: 12px; align-items: center; }
+.net-diag-charts { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.net-diag-chart { display: flex; flex-direction: column; gap: 8px; }
+.net-diag-chart h4 { margin: 0; }
+.net-diag-chart svg { display: block; width: 100%; height: auto; color: var(--ink-3); }
+.net-diag-chart svg text { fill: currentColor; font: 11px var(--mono); }
+.net-diag-chart svg .diag-gridline { stroke: var(--rule); }
+.net-diag-chart svg .diag-line { fill: none; stroke-width: 1.6; vector-effect: non-scaling-stroke; }
+.net-diag-marker { stroke: var(--warn); stroke-opacity: .38; }
+.net-diag-legend { display: flex; gap: 5px 14px; flex-wrap: wrap; margin: 0; padding: 0; list-style: none; font: .75rem var(--mono); }
+.net-diag-legend li { display: flex; align-items: baseline; gap: 5px; }
+.net-diag-legend i { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+.net-diag-events { border-top: 1px solid var(--rule); margin-top: 24px; padding-top: 16px; }
+.net-diag-events h4 { margin-bottom: 10px; }
+.net-diag-event { margin-bottom: 8px; }
+.net-diag-event summary, .net-diag-anomalies summary { cursor: pointer; padding: 9px 0; font-size: .875rem; overflow-wrap: anywhere; }
+.net-diag-event summary time { margin-right: 8px; font: .8rem var(--mono); color: var(--ink-2); }
+.net-diag-event h4 { margin-bottom: 4px; }
+.net-diag-event p { margin: 8px 0; }
+.net-diag-event table { width: 100%; text-align: left; font: .75rem var(--mono); }
+.net-diag-event :is(th, td) { white-space: nowrap; padding: 6px; border-bottom: 1px solid var(--rule); }
+.net-diag-event .diag-table-scroll, .net-diag-anomaly-list { max-height: 20rem; overflow: auto; }
+.net-diag-anomaly-list { font-size: .8125rem; }
+.net-diag-anomaly-list p { padding: 5px 0; }
+@media (max-width: 700px) {
+  .net-diag-overview, .net-diag-charts { grid-template-columns: minmax(0, 1fr); }
+}

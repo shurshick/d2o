@@ -11140,7 +11140,8 @@ static void dns_health_finish(d2k_sched *s, task *t, int64_t now_ms) {
     ready = t->res_ready;
     pthread_mutex_unlock(&s->mu);
     if (!ready || join_worker(t) != 0) return;
-    if (!t->ver.dns_reply) s->network_diag.dns_failures++;
+    if (t->ver.dns_reply) s->network_diag.dns_valid_replies++;
+    else s->network_diag.dns_failures++;
     if (t->ver.local_refusal) s->network_diag.dns_local_failures++;
     if (t->dns_bootstrap_failed) s->network_diag.dns_bootstrap_failures++;
     dns_service_live *live = dns_live_generation(s, t->dns_service_generation);
@@ -11480,6 +11481,7 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                 (t->vol.rx_cut || t->vol.verdict == D2K_VOL_CUT);
             int direct_clear = (r.verdict == D2K_V_CLEAR && !vol_cut && !t->ech_trial &&
                                 !t->vol.rx_partial_bytes && !t->vol.rx_partial_wire_bytes);
+            if (direct_clear) s->network_diag.direct_verified++;
             if (t->yield_to_own_plan) {
                 t->yield_to_own_plan = 0;
                 t->stop = 0;

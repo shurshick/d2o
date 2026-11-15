@@ -2168,6 +2168,13 @@ static int api_diagnostics(int fd,const d2k_panel_config *cfg,const char *req,
     if(!strcmp(method,"POST")) {
         if(!cfg||!cfg->control_enabled||!d2k_panel_same_origin(req))
             return diagnostic_response(fd,403,"Forbidden","application/json","{\"error\":\"требуется запрос с того же источника\"}",sizeof "{\"error\":\"требуется запрос с того же источника\"}"-1);
+        if (!strcmp(action, "network-capture")) {
+            if (!d2k_diag_network_enabled(dir))
+                return diagnostic_response(fd,409,"Conflict","application/json","{}",2);
+            if (d2k_network_request_incident(dir, (uint64_t)monotonic_ms()))
+                return diagnostic_response(fd,503,"Service Unavailable","application/json","{}",2);
+            return diagnostic_response(fd,202,"Accepted","application/json","{}",2);
+        }
         int telegram_action=!strcmp(action,"telegram-enable")||!strcmp(action,"telegram-disable");
         int network_action=!strcmp(action,"network-enable")||!strcmp(action,"network-disable");
         if(strcmp(action,"enable")&&strcmp(action,"disable")&&!telegram_action&&!network_action)

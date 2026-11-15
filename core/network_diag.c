@@ -6,6 +6,7 @@
 
 #include <inttypes.h>
 #include <limits.h>
+#include <stddef.h>
 #include <stdlib.h>
 #include <time.h>
 #include <sys/file.h>
@@ -15,6 +16,16 @@
 #endif
 
 enum { CPU_PROCESSES = 5 };
+
+enum {
+    DNS_FAILED, DNS_VALID, DIRECT_OK, DIAL_TIMEOUT, HOLD_TIMEOUT, PHASE_TIMEOUT,
+    QUEUE_DROPS, NETLINK_DROPS, TCP_ACTIONS, UDP_ACTIONS, DELTA_COUNT
+};
+static const char *const delta_fields[DELTA_COUNT] = {
+    "dns_failures", "dns_valid_replies", "direct_verified", "tcp_dial_timeouts",
+    "hold_timeout_packets", "phase_deadlines", "queue_drops", "netlink_drops",
+    "tcp_prior_exchange_actions", "udp_prior_exchange_actions"
+};
 
 typedef struct {
     int64_t ticks, start, pid;
@@ -32,23 +43,31 @@ typedef struct {
     int64_t backlog, drops, user_drops, netlink_drops;
     int64_t ct_count, ct_max, ct_drop, ct_early_drop, ct_insert_failed;
     wan_snapshot wan[2];
+    int32_t deltas[DELTA_COUNT];
+    unsigned signals;
 } network_sample;
 
 enum {
     MINUTES = 1440, INCIDENTS = 3, BEFORE_MS = 300000, AFTER_MS = 180000,
     INCIDENT_ROWS = (BEFORE_MS + AFTER_MS) / D2K_NET_DIAG_INTERVAL_MS + 1
 };
+enum {
+    VERDICT_DELAY_US = 500000, LOOP_GAP_US = 1000000,
+    TELEMETRY_GAP_MS = 8000, TIMEOUT_BURST_COUNT = 3
+};
 
 enum {
     ROUTE4 = 1, ROUTE6 = 2, LINK4 = 4, LINK6 = 8,
-    QUEUE_LOSS = 16, CONNTRACK_LOSS = 32
+    QUEUE_LOSS = 16, CONNTRACK_LOSS = 32, VERDICT_DELAY = 64, DATAPATH_GAP = 128,
+    BACKLOG_HIGH = 256, TIMEOUT_BURST = 512, MANUAL = 1024, TELEMETRY_GAP = 2048
 };
 
 typedef struct {
     uint64_t mono_minute, at;
     uint32_t triggers, samples;
     int32_t cpu[CPU_PROCESSES], backlog, ct_pct, verdict_us, queued, mem_kib;
-    uint64_t dns_failures;
+    int32_t deltas[DELTA_COUNT];
+    int32_t wan_min[2], loop_us, userspace_us;
 } minute_sample;
 
 typedef struct {
@@ -59,6 +78,8 @@ typedef struct {
 
 struct d2k_network_history {
     uint64_t session, total, last_ms, minute_total, incident_total;
+    uint64_t manual_pending, manual_captured_ms;
+    unsigned previous_signals;
     process_cpu prev[CPU_PROCESSES];
     network_sample samples[D2K_NETWORK_HISTORY];
     minute_sample minutes[MINUTES];
@@ -285,85 +306,163 @@ static int increased(int64_t prev, int64_t now) {
     return prev >= 0 && now > prev;
 }
 
-static unsigned incident_signals(const network_sample *prev, const network_sample *s) {
-    if (!prev) return 0;
+static int same_datapath(const d2k_network_datapath_message *a, const d2k_network_datapath_message *b) {
+    return a->header.pid > 0 && a->header.pid == b->header.pid && a->generation == b->generation &&
+        a->netlink_port == b->netlink_port;
+}
+
+static int32_t counter_delta(uint64_t before, uint64_t after) {
+    if (after < before) return -1;
+    uint64_t delta = after - before;
+    return delta > INT32_MAX ? INT32_MAX : (int32_t)delta;
+}
+
+static int32_t observed_delta(int64_t before, int64_t after) {
+    return before < 0 || after < 0 ? -1 : counter_delta((uint64_t)before, (uint64_t)after);
+}
+
+static int32_t sum_observed(int32_t a, int32_t b) {
+    if (a < 0) return b;
+    if (b < 0) return a;
+    return a > INT32_MAX - b ? INT32_MAX : a + b;
+}
+
+static void sample_deltas(const network_sample *prev, network_sample *s) {
+    for (unsigned i = 0; i < DELTA_COUNT; ++i) s->deltas[i] = -1;
+    if (!prev) return;
+    const d2k_network_controller_message *a = &prev->controller, *b = &s->controller;
+    if (a->header.pid > 0 && a->header.pid == b->header.pid && a->generation == b->generation &&
+        b->mono_ms > a->mono_ms) {
+        s->deltas[DNS_FAILED] = counter_delta(a->counters.dns_failures, b->counters.dns_failures);
+        s->deltas[DNS_VALID] = counter_delta(a->counters.dns_valid_replies, b->counters.dns_valid_replies);
+        s->deltas[DIRECT_OK] = counter_delta(a->counters.direct_verified, b->counters.direct_verified);
+        s->deltas[DIAL_TIMEOUT] = counter_delta(a->counters.tcp_dial_deadlines, b->counters.tcp_dial_deadlines);
+        s->deltas[PHASE_TIMEOUT] = counter_delta(a->counters.phase_deadlines, b->counters.phase_deadlines);
+    }
+    if (!same_datapath(&prev->datapath, &s->datapath)) return;
+    s->deltas[QUEUE_DROPS] = sum_observed(observed_delta(prev->drops, s->drops),
+                                         observed_delta(prev->user_drops, s->user_drops));
+    s->deltas[NETLINK_DROPS] = observed_delta(prev->netlink_drops, s->netlink_drops);
+    if (s->datapath.mono_ms <= prev->datapath.mono_ms) return;
+    const d2k_network_datapath *old = &prev->datapath.counters, *now = &s->datapath.counters;
+    s->deltas[HOLD_TIMEOUT] = sum_observed(counter_delta(old->tcp_hold_timeouts, now->tcp_hold_timeouts),
+                                          counter_delta(old->udp_hold_timeouts, now->udp_hold_timeouts));
+    s->deltas[TCP_ACTIONS] = counter_delta(old->tcp_prior_exchange_actions, now->tcp_prior_exchange_actions);
+    s->deltas[UDP_ACTIONS] = counter_delta(old->udp_prior_exchange_actions, now->udp_prior_exchange_actions);
+}
+
+static unsigned incident_signals(const network_sample *prev, const network_sample *s,
+                                 const d2k_network_datapath_message *last, process_cpu process) {
     unsigned result = 0;
+    if (last->header.pid > 0 && process.pid == last->header.pid && process.start >= 0 &&
+        (uint64_t)process.start == last->generation && last->mono_ms <= s->mono_ms &&
+        s->mono_ms - last->mono_ms >= TELEMETRY_GAP_MS)
+        result |= TELEMETRY_GAP;
+    const d2k_network_datapath_message *b = &s->datapath;
+    const d2k_network_datapath *c = &b->counters;
+    if (b->header.pid > 0) {
+        /* A verdict may intentionally be held briefly. Flag only a long delay. */
+        if ((c->verdict_max_us != UINT64_MAX && c->verdict_max_us >= VERDICT_DELAY_US) ||
+            (c->userspace_verdict_max_us != UINT64_MAX && c->userspace_verdict_max_us >= VERDICT_DELAY_US))
+            result |= VERDICT_DELAY;
+        /* The normal idle poll ceiling is 200 ms. */
+        if (c->loop_max_us >= LOOP_GAP_US) result |= DATAPATH_GAP;
+    }
+    if (!prev) return result;
     for (unsigned i = 0; i < 2; ++i) {
-        const wan_snapshot *a = &prev->wan[i], *b = &s->wan[i];
-        if (a->routes > 0 && b->routes == 0) result |= ROUTE4 << i;
-        if (a->ifindex > 0 && a->ifindex == b->ifindex && a->carrier == 1 && b->carrier == 0)
+        const wan_snapshot *a = &prev->wan[i], *w = &s->wan[i];
+        if (a->routes > 0 && w->routes == 0) result |= ROUTE4 << i;
+        if (a->ifindex > 0 && a->ifindex == w->ifindex && a->carrier == 1 && w->carrier == 0)
             result |= LINK4 << i;
     }
-    const d2k_network_datapath_message *a = &prev->datapath, *b = &s->datapath;
-    if (a->header.pid > 0 && a->header.pid == b->header.pid && a->generation == b->generation &&
-        a->netlink_port == b->netlink_port &&
-        (increased(prev->drops, s->drops) || increased(prev->user_drops, s->user_drops) ||
-         increased(prev->netlink_drops, s->netlink_drops) || b->counters.enobufs > a->counters.enobufs))
-        result |= QUEUE_LOSS;
+    if (same_datapath(&prev->datapath, b)) {
+        if (s->deltas[QUEUE_DROPS] > 0 || s->deltas[NETLINK_DROPS] > 0 ||
+            c->enobufs > prev->datapath.counters.enobufs)
+            result |= QUEUE_LOSS;
+        int64_t limit = b->queue_limit;
+        if (s->mono_ms - prev->mono_ms <= 2 * D2K_NET_DIAG_INTERVAL_MS &&
+            limit > 0 && prev->backlog >= 0 && s->backlog >= 0 &&
+            ((4 * s->backlog >= 3 * limit && 4 * prev->backlog >= 3 * limit) ||
+             (2 * s->backlog >= limit && 4 * (s->backlog - prev->backlog) >= limit)))
+            result |= BACKLOG_HIGH;
+    }
     if (increased(prev->ct_drop, s->ct_drop) || increased(prev->ct_early_drop, s->ct_early_drop))
         result |= CONNTRACK_LOSS;
+    /* Hold counters count packets. Keep them distinct from measurement timeouts. */
+    if (s->deltas[DIAL_TIMEOUT] >= TIMEOUT_BURST_COUNT ||
+        s->deltas[PHASE_TIMEOUT] >= TIMEOUT_BURST_COUNT || s->deltas[HOLD_TIMEOUT] >= TIMEOUT_BURST_COUNT)
+        result |= TIMEOUT_BURST;
     return result;
 }
 
 static void record_incident(d2k_network_history *h, const network_sample *s, unsigned triggers) {
-    incident *active = h->incident_total ? &h->incidents[(h->incident_total - 1) % INCIDENTS] : NULL;
-    if (active && !active->complete) {
-        if (s->mono_ms - active->trigger_ms <= AFTER_MS && active->count < INCIDENT_ROWS) {
-            active->rows[active->count++] = *s;
-            active->reasons |= triggers;
-            if (s->mono_ms - active->trigger_ms < AFTER_MS) return;
-            active->complete = 1;
-            return;
+    unsigned active = 0;
+    uint64_t first = h->incident_total > INCIDENTS ? h->incident_total - INCIDENTS : 0;
+    for (uint64_t i = first; i < h->incident_total; ++i) {
+        incident *e = &h->incidents[i % INCIDENTS];
+        if (e->complete) continue;
+        uint64_t elapsed = s->mono_ms - e->trigger_ms;
+        if (elapsed <= AFTER_MS && e->count < INCIDENT_ROWS) {
+            e->rows[e->count++] = *s;
+            e->reasons |= s->signals & ~MANUAL;
+            active = 1;
         }
-        active->complete = 1;
+        if (elapsed >= AFTER_MS || e->count == INCIDENT_ROWS) e->complete = 1;
     }
-    if (!triggers) return;
-    active = &h->incidents[h->incident_total++ % INCIDENTS];
-    active->at = s->at;
-    active->trigger_ms = s->mono_ms;
-    active->reasons = triggers;
-    active->count = active->complete = 0;
+    if (!triggers || (active && !(triggers & MANUAL))) return;
+    incident *e = &h->incidents[h->incident_total++ % INCIDENTS];
+    e->at = s->at;
+    e->trigger_ms = s->mono_ms;
+    e->reasons = s->signals;
+    e->count = e->complete = 0;
     uint64_t start = h->total > D2K_NETWORK_HISTORY ? h->total - D2K_NETWORK_HISTORY : 0;
     for (uint64_t i = start; i < h->total; ++i) {
         const network_sample *prev = &h->samples[i % D2K_NETWORK_HISTORY];
-        if (prev->mono_ms > s->mono_ms || s->mono_ms - prev->mono_ms > BEFORE_MS) continue;
-        if (active->count >= INCIDENT_ROWS - 1) break;
-        active->rows[active->count++] = *prev;
+        if (s->mono_ms - prev->mono_ms <= BEFORE_MS) e->rows[e->count++] = *prev;
     }
-    active->rows[active->count++] = *s;
+    e->rows[e->count++] = *s;
 }
 
 static void peak(int32_t *value, int64_t sample) {
     if (sample > *value) *value = sample > INT32_MAX ? INT32_MAX : (int32_t)sample;
 }
 
-static void record_minute(d2k_network_history *h, const network_sample *s,
-                          const network_sample *prev, unsigned triggers) {
+static void record_minute(d2k_network_history *h, const network_sample *s, const network_sample *prev) {
     uint64_t key = s->mono_ms / 60000;
     minute_sample *m = &h->minutes[(h->minute_total ? h->minute_total - 1 : 0) % MINUTES];
     if (!h->minute_total || m->mono_minute != key) {
         m = &h->minutes[h->minute_total++ % MINUTES];
         *m = (minute_sample){.mono_minute = key, .at = s->at, .backlog = -1, .ct_pct = -1,
-            .verdict_us = -1, .queued = -1, .mem_kib = -1, .cpu = {-1,-1,-1,-1,-1}};
+            .verdict_us = -1, .queued = -1, .mem_kib = -1, .cpu = {-1,-1,-1,-1,-1},
+            .wan_min = {-1,-1}, .loop_us = -1, .userspace_us = -1};
+        for (unsigned i = 0; i < DELTA_COUNT; ++i) m->deltas[i] = -1;
     }
     m->samples++;
-    m->triggers |= triggers;
+    m->triggers |= s->signals;
+    for (unsigned i = 0; i < DELTA_COUNT; ++i)
+        m->deltas[i] = sum_observed(m->deltas[i], s->deltas[i]);
+    for (unsigned i = 0; i < 2; ++i) {
+        int64_t routes = s->wan[i].routes;
+        if (routes >= 0 && (m->wan_min[i] < 0 || routes < m->wan_min[i]))
+            m->wan_min[i] = routes > INT32_MAX ? INT32_MAX : (int32_t)routes;
+    }
     for (unsigned i = 0; i < CPU_PROCESSES; ++i) peak(&m->cpu[i], s->cpu_pct[i]);
     peak(&m->backlog, s->backlog);
     if (s->ct_count >= 0 && s->ct_max > 0 && s->ct_count <= INT64_MAX / 100)
         peak(&m->ct_pct, 100 * s->ct_count / s->ct_max);
-    if (s->datapath.header.pid > 0 && s->datapath.counters.verdict_max_us <= INT64_MAX)
-        peak(&m->verdict_us, (int64_t)s->datapath.counters.verdict_max_us);
+    const d2k_network_datapath_message *d = &s->datapath;
+    if (d->header.pid > 0 && (!prev || !same_datapath(&prev->datapath, d) || d->mono_ms != prev->datapath.mono_ms)) {
+        if (d->counters.verdict_max_us <= INT64_MAX) peak(&m->verdict_us, (int64_t)d->counters.verdict_max_us);
+        if (d->counters.userspace_verdict_max_us <= INT64_MAX)
+            peak(&m->userspace_us, (int64_t)d->counters.userspace_verdict_max_us);
+        peak(&m->loop_us, (int64_t)d->counters.loop_max_us);
+    }
     const d2k_network_controller_message *c = &s->controller;
     if (c->header.pid <= 0) return;
     peak(&m->queued, c->queued);
     if (c->mem_available_kib <= INT32_MAX && (m->mem_kib < 0 || c->mem_available_kib < (uint32_t)m->mem_kib))
         m->mem_kib = (int32_t)c->mem_available_kib;
-    if (prev && prev->controller.header.pid == c->header.pid && prev->controller.generation == c->generation &&
-        c->counters.dns_failures >= prev->controller.counters.dns_failures) {
-        uint64_t delta = c->counters.dns_failures - prev->controller.counters.dns_failures;
-        m->dns_failures += delta > UINT64_MAX - m->dns_failures ? UINT64_MAX - m->dns_failures : delta;
-    }
+
 }
 
 static int fresh(uint64_t sample, uint64_t now) {
@@ -385,9 +484,18 @@ void d2k_network_history_sample(d2k_network_history *h, uint64_t now,
     sample_wan(&sample->wan[0], proc, sys, 0);
     sample_wan(&sample->wan[1], proc, sys, 1);
     const network_sample *prev = h->total ? &h->samples[(h->total - 1) % D2K_NETWORK_HISTORY] : NULL;
-    unsigned triggers = incident_signals(prev, sample);
+    sample_deltas(prev, sample);
+    sample->signals = incident_signals(prev, sample, datapath, h->prev[1]);
+    if (h->manual_pending) {
+        sample->signals |= MANUAL;
+        h->manual_pending = 0;
+        h->manual_captured_ms = now;
+    }
+    const unsigned levels = VERDICT_DELAY | DATAPATH_GAP | BACKLOG_HIGH | TIMEOUT_BURST | TELEMETRY_GAP;
+    unsigned triggers = sample->signals & ~(h->previous_signals & levels);
+    h->previous_signals = sample->signals;
     record_incident(h, sample, triggers);
-    record_minute(h, sample, prev, triggers);
+    record_minute(h, sample, prev);
     h->samples[h->total++ % D2K_NETWORK_HISTORY] = current;
     h->last_ms = now;
 }
@@ -451,8 +559,18 @@ static void write_controller(FILE *out, const d2k_network_controller_message *m)
     const d2k_network_controller *c = &m->counters;
     const uint64_t counts[] = {c->measurements, c->measurement_restarts, c->probe_units, c->queue_expired,
         c->phase_deadlines, c->tcp_dial_deadlines, c->dns_checks, c->dns_failures, c->dns_local_failures,
-        c->dns_bootstrap_failures, c->dns_config_failures, c->dns_config_max_ms};
+        c->dns_bootstrap_failures, c->dns_config_failures, c->dns_config_max_ms,
+        c->dns_valid_replies, c->direct_verified};
     for (size_t i = 0; i < sizeof(counts) / sizeof(counts[0]); i++) fprintf(out, ",%" PRIu64, counts[i]);
+    fputc(']', out);
+}
+
+static void write_deltas(FILE *out, const int32_t values[DELTA_COUNT]) {
+    fputc('[', out);
+    for (unsigned i = 0; i < DELTA_COUNT; ++i) {
+        if (i) fputc(',', out);
+        signed_value(out, values[i]);
+    }
     fputc(']', out);
 }
 
@@ -473,13 +591,16 @@ static void write_sample(FILE *out, const network_sample *s, uint64_t *previous_
     fputc(',', out); write_datapath(out, s, *previous_mono);
     *previous_mono = s->datapath.mono_ms;
     fputc(',', out); write_controller(out, &s->controller);
+    fputc(',', out); write_deltas(out, s->deltas);
+    fprintf(out, ",%u", s->signals);
     fputc(']', out);
 }
 
 static void write_minutes(FILE *out, const d2k_network_history *h) {
     fputs(",\"minute_interval_ms\":60000,\"minute_fields\":[\"at\",\"mono_minute\",\"sample_count\","
           "\"triggers\",\"cpu_peak_pct\",\"queue_peak\",\"conntrack_peak_pct\",\"verdict_peak_us\","
-          "\"measurements_queued_peak\",\"mem_available_min_kib\",\"observed_dns_failures\"],\"minutes\":[", out);
+          "\"measurements_queued_peak\",\"mem_available_min_kib\",\"observed_dns_failures\","
+          "\"deltas\",\"wan4_route_min\",\"wan6_route_min\",\"loop_gap_peak_us\",\"userspace_verdict_peak_us\"],\"minutes\":[", out);
     uint64_t start = h->minute_total > MINUTES ? h->minute_total - MINUTES : 0;
     int comma = 0;
     for (uint64_t i = start; i < h->minute_total && !ferror(out); ++i) {
@@ -497,7 +618,13 @@ static void write_minutes(FILE *out, const d2k_network_history *h) {
             fputc(',', out);
             signed_value(out, values[j]);
         }
-        fprintf(out, ",%" PRIu64 "]", m->dns_failures);
+        fputc(',', out); signed_value(out, m->deltas[DNS_FAILED]);
+        fputc(',', out); write_deltas(out, m->deltas);
+        const int32_t extra[] = {m->wan_min[0], m->wan_min[1], m->loop_us, m->userspace_us};
+        for (size_t j = 0; j < sizeof(extra) / sizeof(extra[0]); ++j) {
+            fputc(',', out); signed_value(out, extra[j]);
+        }
+        fputc(']', out);
     }
     fputc(']', out);
 }
@@ -505,8 +632,13 @@ static void write_minutes(FILE *out, const d2k_network_history *h) {
 static void write_incidents(FILE *out, const d2k_network_history *h) {
     fprintf(out, ",\"incidents_overwritten\":%" PRIu64,
             h->incident_total > INCIDENTS ? h->incident_total - INCIDENTS : 0);
+    fprintf(out, ",\"incident_thresholds\":{\"verdict_us\":%u,\"datapath_loop_us\":%u,"
+            "\"datapath_telemetry_ms\":%u,\"timeouts_per_category\":%u,"
+            "\"queue_sustained_pct\":75,\"queue_growth_pct\":25,\"queue_growth_min_pct\":50}",
+            VERDICT_DELAY_US, LOOP_GAP_US, TELEMETRY_GAP_MS, TIMEOUT_BURST_COUNT);
     fputs(",\"incident_signals\":[\"wan4_route_lost\",\"wan6_route_lost\",\"wan4_carrier_lost\","
-          "\"wan6_carrier_lost\",\"queue_loss\",\"conntrack_loss\"],\"incidents\":[", out);
+          "\"wan6_carrier_lost\",\"queue_loss\",\"conntrack_loss\",\"verdict_delay\","
+          "\"datapath_loop_gap\",\"queue_pressure\",\"timeout_burst\",\"manual\",\"datapath_telemetry_gap\"],\"incidents\":[", out);
     uint64_t start = h->incident_total > INCIDENTS ? h->incident_total - INCIDENTS : 0;
     for (uint64_t i = start; i < h->incident_total && !ferror(out); ++i) {
         const incident *e = &h->incidents[i % INCIDENTS];
@@ -533,7 +665,7 @@ void d2k_network_history_write(FILE *out, const d2k_network_history *h) {
             "\"ram_reserved_bytes\":%zu,\"ram_budget_bytes\":%u,",
             D2K_NET_DIAG_INTERVAL_MS, D2K_NETWORK_HISTORY, start, sizeof(*h),
             d2k_network_history_bytes(), D2K_NETWORK_BUDGET);
-    fputs("\"fields\":[\"at\",\"mono_ms\",\"cpu_pct_one_core\",\"conntrack\",\"wan4\",\"wan6\",\"nfqueue\",\"controller\"],"
+    fputs("\"fields\":[\"at\",\"mono_ms\",\"cpu_pct_one_core\",\"conntrack\",\"wan4\",\"wan6\",\"nfqueue\",\"controller\",\"deltas\",\"signals\"],"
           "\"cpu_fields\":[\"d2kc\",\"d2kd\",\"d2kpanel\",\"d2kdiag\",\"d2ktg\"],"
           "\"conntrack_fields\":[\"count\",\"max\",\"drop\",\"early_drop\",\"insert_failed\"],"
           "\"wan_fields\":[\"default_routes\",\"ifindex\",\"operstate\",\"carrier\",\"rx_errors\",\"tx_errors\",\"rx_dropped\",\"tx_dropped\"],"
@@ -551,8 +683,12 @@ void d2k_network_history_write(FILE *out, const d2k_network_history *h) {
           "\"cpu_free_pct\",\"mem_available_kib\",\"classifier_workers_started\",\"classifier_restarts_same_task\",\"classifier_completed_probe_units\","
           "\"queue_expired\",\"phase_deadlines\",\"tcp_dial_deadline_results\",\"encrypted_dns_checks_started\","
           "\"encrypted_dns_checks_without_valid_reply\",\"encrypted_dns_local_failures\","
-          "\"dns_bootstrap_failures\",\"dns_config_failures\",\"dns_config_max_ms\"],"
-          "\"samples\":[", out);
+          "\"dns_bootstrap_failures\",\"dns_config_failures\",\"dns_config_max_ms\",\"encrypted_dns_valid_replies\","
+          "\"direct_verified\"],\"delta_fields\":[", out);
+    for (unsigned i = 0; i < DELTA_COUNT; ++i)
+        fprintf(out, "%s\"%s\"", i ? "," : "", delta_fields[i]);
+    fprintf(out, "],\"manual_pending\":%s,\"manual_captured_ms\":%" PRIu64 ",\"samples\":[",
+            h->manual_pending ? "true" : "false", h->manual_captured_ms);
     uint64_t previous_mono = UINT64_MAX;
     for (uint64_t i = start; i < h->total && !ferror(out); i++) {
         const network_sample *s = &h->samples[i % D2K_NETWORK_HISTORY];
@@ -617,6 +753,25 @@ int d2k_network_open(const char *dir, const char *name, int create) {
     (void)dir; (void)name; (void)create;
 #endif
     return -1;
+}
+
+int d2k_network_request_incident(const char *dir, uint64_t now) {
+    uint64_t session = d2k_network_session(dir);
+    if (!session) return -1;
+    int fd = d2k_network_open(dir, D2K_NETWORK_STATE, 1);
+    if (fd < 0) return -1;
+    struct stat st;
+    uint64_t stored, total, last, pending = 1;
+    int accepted = flock(fd, LOCK_EX | LOCK_NB) == 0 &&
+        fstat(fd, &st) == 0 && st.st_size == sizeof(d2k_network_history) &&
+        pread(fd, &stored, sizeof(stored), 0) == sizeof(stored) && stored == session &&
+        pread(fd, &total, sizeof(total), offsetof(d2k_network_history, total)) == sizeof(total) && total &&
+        pread(fd, &last, sizeof(last), offsetof(d2k_network_history, last_ms)) == sizeof(last) &&
+        last <= now && now - last <= 8000 &&
+        d2k_network_session(dir) == session &&
+        pwrite(fd, &pending, sizeof(pending), offsetof(d2k_network_history, manual_pending)) == sizeof(pending);
+    close(fd);
+    return accepted ? 0 : -1;
 }
 
 /* The caller holds the state lock. Allocate backing before mmap so a full

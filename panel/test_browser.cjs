@@ -243,7 +243,23 @@ function diagnosticFixture(kind='full'){
      age_ms:60000,no_progress_ms:3000,bytes_from_clients:307200,bytes_from_upstreams:153600,
      read_paused:false,stage:'first_wss_binary_response'}],problem_sessions:[]}}};
 }
-let ws,diagnosticsReply=null;
+let ws,diagnosticsReply=null,networkCaptured=false;
+const networkAt=Math.floor(now/1000);
+const networkRow=[networkAt,120000,[20,5,null,null,null],null,[1,1],[0,null],[32,510000,200000,1000000],
+ [1,1,1,3,0,0,2,0,2,1],1];
+function networkFixture(){
+ return {fields:['at','mono_ms','cpu_pct_one_core','conntrack','wan4','wan6','nfqueue','deltas','signals'],
+  wan_fields:['default_routes','carrier'],
+  nfqueue_fields:['backlog','kernel_packet_to_verdict_max_us','userspace_read_to_verdict_max_us','loop_gap_max_us'],
+  delta_fields:['dns_failures','dns_valid_replies','direct_verified','tcp_dial_timeouts','hold_timeout_packets',
+   'phase_deadlines','queue_drops','netlink_drops','tcp_prior_exchange_actions','udp_prior_exchange_actions'],
+  minute_fields:['at','mono_minute','triggers','cpu_peak_pct','queue_peak','verdict_peak_us','userspace_verdict_peak_us',
+   'loop_gap_peak_us','deltas','wan4_route_min','wan6_route_min'],
+  samples:[[networkAt-2,118000,[10,3,null,null,null],...networkRow.slice(3,8),0],networkRow],
+  minutes:[[networkAt,2,1,[30,10,null,null,null],41,510000,200000,1000000,networkRow[7],1,0]],
+  incident_signals:['verdict_delay','manual'],manual_captured_ms:networkCaptured?120000:0,
+  incidents:[{at:networkAt,trigger_ms:120000,signals:networkCaptured?3:1,complete:false,samples:[networkRow]}]};
+}
 async function main(){
  let port;
  for(let i=0;i<100;i++){try{const activePort=fs.readFileSync(path.join(profile,'DevToolsActivePort'),'utf8').split('\n')[0];if(activePort){port=activePort;break}}catch{}await new Promise(r=>setTimeout(r,100))}
@@ -258,14 +274,20 @@ async function main(){
   if(x.params.request.url.includes('/api/diagnostics?status')){
    const report=diagnosticsReply||{};
    const flags={enabled:report.general_enabled===true||report.enabled===true,
-    telegram_enabled:report.telegram_enabled===true};
+    telegram_enabled:report.telegram_enabled===true,network_enabled:report.network_enabled===true};
    call('Fetch.fulfillRequest',{requestId:x.params.requestId,responseCode:200,
     responseHeaders:[{name:'Content-Type',value:'application/json; charset=utf-8'}],
     body:Buffer.from(JSON.stringify(flags)).toString('base64')});
   }else if(x.params.request.url.includes('/api/diagnostics?report'))call('Fetch.fulfillRequest',{requestId:x.params.requestId,responseCode:200,
    responseHeaders:[{name:'Content-Type',value:'application/json; charset=utf-8'}],
    body:Buffer.from(JSON.stringify(diagnosticsReply||{enabled:false})).toString('base64')});
-  else call('Fetch.continueRequest',{requestId:x.params.requestId});}};
+  else if(x.params.request.url.includes('/api/diagnostics?network-report'))call('Fetch.fulfillRequest',{
+   requestId:x.params.requestId,responseCode:200,responseHeaders:[{name:'Content-Type',value:'application/json'}],
+   body:Buffer.from(JSON.stringify(networkFixture())).toString('base64')});
+  else if(x.params.request.url.includes('/api/diagnostics?network-capture') && x.params.request.method==='POST'){
+   networkCaptured=true;
+   call('Fetch.fulfillRequest',{requestId:x.params.requestId,responseCode:202,body:Buffer.from('{}').toString('base64')});
+  }else call('Fetch.continueRequest',{requestId:x.params.requestId});}};
  const call=(method,params={})=>new Promise((resolve,reject)=>{pending.set(++id,{resolve,reject});ws.send(JSON.stringify({id,method,params}))});
  const evaluate=async(expression)=>{try{const r=await call('Runtime.evaluate',{expression,awaitPromise:true,returnByValue:true});if(r.exceptionDetails)throw Error(JSON.stringify(r.exceptionDetails));return r.result.value}catch(e){throw Error('Runtime.evaluate failed for '+expression+': '+(e?.message||JSON.stringify(e)))}};
  const wait=ms=>new Promise(r=>setTimeout(r,ms));
@@ -898,7 +920,7 @@ async function main(){
   await call('Emulation.setEmulatedMedia',{features:[]});
   await call('Emulation.setDeviceMetricsOverride',{width:1440,height:900,deviceScaleFactor:1,mobile:false});
   await call('Fetch.enable',{patterns:[{url:'*',requestStage:'Request'}]});
-  diagnosticsReply=diagnosticFixture('full');
+  diagnosticsReply={...diagnosticFixture('full'),network_enabled:true};
   await call('Page.reload');
   await until('document.querySelector("#diagnostic-memory-chart")?.dataset.points==="121"','two-hour diagnostics history renders');
   await evaluate('document.querySelector("[data-memory-range=\\"24\\"]").click()');
@@ -939,6 +961,24 @@ async function main(){
    'Network diagnostics remain visible after selecting their tab');
   assert.equal(await evaluate('document.querySelector("#diagnostic-general-panel").hidden'),true);
   assert.equal(await evaluate('document.querySelector("#diagnostic-telegram-panel").hidden'),true);
+  await until('document.querySelectorAll("#network-diagnostic-charts svg").length===6','Network graphs render measured data');
+  await evaluate('document.querySelector("[data-network-range=\"24\"]").click()');
+  assert.match(await evaluate('document.querySelector("#network-range-note").textContent'),/Минутные пики/);
+  assert.match(await evaluate('document.querySelectorAll(".net-diag-chart")[1].textContent'),/41/);
+  await evaluate('document.querySelector("[data-network-range=\"8\"]").click()');
+  assert.match(await evaluate('document.querySelectorAll(".net-diag-chart")[1].textContent'),/32/);
+  await evaluate('document.querySelector("#network-diagnostic-capture").click()');
+  await until('document.querySelector("#network-capture-status").textContent.includes("Отметка сохранена")',
+   'manual capture is confirmed when the collector report contains the mark');
+  await evaluate('document.querySelector("#network-diagnostic-incidents summary").click()');
+  await until('document.querySelector("#network-diagnostic-incidents tbody td")','incident details open');
+  assert.match(await evaluate('document.querySelector("#network-diagnostic-incidents").textContent'),/Отметка пользователя/);
+  for(const width of [320,390]){
+   await call('Emulation.setDeviceMetricsOverride',{width,height:844,deviceScaleFactor:1,mobile:true});
+   await until('innerWidth==='+width,'Network tab uses the emulated viewport');
+   assert.equal(await evaluate('document.documentElement.scrollWidth>innerWidth'),false,'Network fits '+width+'px with incident details open');
+  }
+  await call('Emulation.setDeviceMetricsOverride',{width:1440,height:900,deviceScaleFactor:1,mobile:false});
   await evaluate('document.querySelector("#diagnostic-general-tab").click()');
   assert.equal(await evaluate('document.querySelector("#diagnostic-data").getClientRects().length > 0'),true,
    'general diagnostics can be reopened after visiting Network');

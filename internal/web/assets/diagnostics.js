@@ -916,48 +916,230 @@
     telegramLimitReasons: telegramLimitReasons
   };
   if (!root.document || !root.fetch) return;
-  function renderNetwork(doc, report) {
-    var list=doc.getElementById("network-diagnostic-incidents");
-    if (!list) return;
-    var expanded=Array.prototype.map.call(list.querySelectorAll("details[open]"),function(card){return card.dataset.trigger;});
+  var networkSignalLabels = {
+    wan4_route_lost: "Пропал маршрут IPv4", wan6_route_lost: "Пропал маршрут IPv6",
+    wan4_carrier_lost: "Пропал линк IPv4", wan6_carrier_lost: "Пропал линк IPv6",
+    queue_loss: "Рост потерь NFQUEUE / netlink", conntrack_loss: "Рост потерь conntrack",
+    verdict_delay: "Вердикт NFQUEUE ≥ 500 мс", datapath_loop_gap: "Пауза цикла d2kd ≥ 1 с",
+    queue_pressure: "Резкий рост очереди или два замера NFQUEUE ≥ 75%",
+    timeout_burst: "Не менее 3 таймаутов одного типа за интервал", manual: "Отметка пользователя",
+    datapath_telemetry_gap: "d2kd работает, но телеметрия отсутствует ≥ 8 с"
+  };
+  var networkMetrics = [
+    ["CPU процессов", "% одного ядра", ["d2kc","d2kd","d2kpanel","d2kdiag","d2ktg"]],
+    ["Очередь NFQUEUE", "пакеты", ["Ожидают вердикта"]],
+    ["Задержки", "мс", ["От ядра до вердикта","От чтения до вердикта","Пауза цикла d2kd"]],
+    ["Потери", "пакеты", ["NFQUEUE","Сокет netlink"]],
+    ["DNS", "проверки", ["Ответ подтверждён","Без подтверждённого ответа"]],
+    ["WAN", "маршруты по умолчанию", ["IPv4","IPv6"]]
+  ];
+  var networkColors = ["var(--signal)", "#4d79c7", "var(--ok)", "#a46bc1", "var(--warn)"];
+  function networkReasons(report, mask) {
+    return (report.incident_signals || []).filter(function(key, i){return mask & (1 << i);})
+      .map(function(key){return networkSignalLabels[key] || key;});
+  }
+  function networkAccessor(fields) {
+    return function(values, key) {
+      var i = (fields || []).indexOf(key);
+      return values && i >= 0 && values[i] != null ? values[i] : null;
+    };
+  }
+  function networkRows(report, daily, source) {
+    var field = networkAccessor(daily ? report.minute_fields : report.fields);
+    var queue = networkAccessor(report.nfqueue_fields), wan = networkAccessor(report.wan_fields);
+    var delta = networkAccessor(report.delta_fields);
+    function ms(value) { return value == null ? null : value / 1000; }
+    return source.map(function(row) {
+      var q = field(row,"nfqueue"), w4 = field(row,"wan4"), w6 = field(row,"wan6");
+      var d = field(row,"deltas"), failed = delta(d,"dns_failures");
+      return {
+        at: field(row,"at"), mono: daily ? field(row,"mono_minute") * 60000 : field(row,"mono_ms"),
+        signals: field(row,daily ? "triggers" : "signals"), direct: delta(d,"direct_verified"),
+        actions: [delta(d,"tcp_prior_exchange_actions"),delta(d,"udp_prior_exchange_actions")],
+        timeouts: [delta(d,"tcp_dial_timeouts"),delta(d,"hold_timeout_packets"),delta(d,"phase_deadlines")],
+        metrics: [
+          field(row,daily ? "cpu_peak_pct" : "cpu_pct_one_core") || [],
+          [daily ? field(row,"queue_peak") : queue(q,"backlog")],
+          daily ? [ms(field(row,"verdict_peak_us")),ms(field(row,"userspace_verdict_peak_us")),ms(field(row,"loop_gap_peak_us"))] :
+            [ms(queue(q,"kernel_packet_to_verdict_max_us")),ms(queue(q,"userspace_read_to_verdict_max_us")),ms(queue(q,"loop_gap_max_us"))],
+          [delta(d,"queue_drops"),delta(d,"netlink_drops")],
+          [delta(d,"dns_valid_replies"),failed == null && daily ? field(row,"observed_dns_failures") : failed],
+          daily ? [field(row,"wan4_route_min"),field(row,"wan6_route_min")] : [wan(w4,"default_routes"),wan(w6,"default_routes")]
+        ]
+      };
+    });
+  }
+  function networkTime(at, daily) {
+    if (at == null) return "—";
+    return new Date(at * 1000).toLocaleTimeString([], {hour:"2-digit", minute:"2-digit", second:daily ? undefined : "2-digit"});
+  }
+  function networkValue(value) { return value == null ? "—" : pretty(value); }
+  function renderNetworkChart(doc, rows, metric, daily) {
+    var spec = networkMetrics[metric], labels = spec[2];
+    var card = doc.createElement("section"), title = doc.createElement("h4"), legend = doc.createElement("ul");
+    card.className = "diag-card net-diag-chart";
+    title.textContent = spec[0];
+    card.appendChild(title);
+    legend.className = "net-diag-legend";
+    var peak = null;
+    rows.forEach(function(row) {
+      row.metrics[metric].forEach(function(value) {
+        if (value == null) return;
+        peak = Math.max(peak || 0, value);
+      });
+    });
+    if (peak == null) {
+      var empty = doc.createElement("p");
+      empty.className = "diag-empty";
+      empty.textContent = "Нет данных за этот период";
+      card.appendChild(empty);
+      return card;
+    }
+    var plot = svg(doc,"svg",{viewBox:"0 0 440 132", role:"img", "aria-label":spec[0]+" · "+spec[1]});
+    var last = rows[rows.length - 1], first = last.mono - (daily ? 1439 * 60000 : 478000);
+    var upper = Math.max(1, Math.ceil(peak));
+    function x(sample) { return 48 + 373 * (sample.mono - first) / (last.mono - first); }
+    function y(value) { return 102 - value * 87 / upper; }
+    [0, upper/2, upper].forEach(function(value) {
+      plot.appendChild(svg(doc,"line",{x1:48,x2:421,y1:y(value),y2:y(value),class:"diag-gridline"}));
+      var label = svg(doc,"text",{x:42,y:y(value)+4,"text-anchor":"end"});
+      label.textContent = new Intl.NumberFormat(undefined,{notation:"compact",maximumFractionDigits:1}).format(value);
+      plot.appendChild(label);
+    });
+    [0, 0.5, 1].forEach(function(fraction) {
+      var label = svg(doc,"text",{x:48+373*fraction,y:122,"text-anchor":"middle"});
+      label.textContent = networkTime(last.at-(last.mono-first)*(1-fraction)/1000,daily);
+      plot.appendChild(label);
+    });
+    var markers = rows.filter(function(row){return row.signals;}).map(function(row){
+      return "M"+x(row).toFixed(1)+",15v87";
+    });
+    if (markers.length) plot.appendChild(svg(doc,"path",{d:markers.join(""),class:"net-diag-marker",fill:"none"}));
+    labels.forEach(function(label,i) {
+      var path = "", previous = null, color = networkColors[i];
+      rows.forEach(function(row) {
+        var value = row.metrics[metric][i];
+        if (value == null) { previous = null; return; }
+        var point = x(row).toFixed(1)+","+y(value).toFixed(1);
+        var linked = previous != null && row.mono-previous <= (daily ? 60000 : 4000);
+        path += (linked ? "L" : "M")+point+(linked ? "" : "h.8");
+        previous = row.mono;
+      });
+      if (path) plot.appendChild(svg(doc,"path",{d:path,class:"diag-line",stroke:color}));
+      var item = doc.createElement("li"), swatch = doc.createElement("i");
+      swatch.style.backgroundColor = color;
+      item.appendChild(swatch);
+      var newest = last.metrics[metric][i];
+      item.appendChild(doc.createTextNode(label+" · "+networkValue(newest)));
+      legend.appendChild(item);
+    });
+    card.appendChild(plot);
+    card.appendChild(legend);
+    var units = doc.createElement("p");
+    units.className = "diag-history-note";
+    units.textContent = spec[1];
+    card.appendChild(units);
+    return card;
+  }
+  function renderNetworkOverview(doc, minutes, detailed) {
+    var overview = doc.getElementById("network-diagnostic-overview");
+    function observed(value) {
+      var row = detailed.slice().reverse().find(value);
+      if (row) return networkTime(row.at,false);
+      row = minutes.slice().reverse().find(value);
+      return row ? "минута около "+networkTime(row.at,true) : "нет подтверждения в истории";
+    }
+    function status(title, copy) {
+      var box = doc.createElement("div"), strong = doc.createElement("strong"), text = doc.createElement("p");
+      strong.textContent = title;
+      text.className = "diag-history-note";
+      text.textContent = copy;
+      box.append(strong,text);
+      overview.appendChild(box);
+    }
+    overview.replaceChildren();
+    status("Прямой доступ · штатные проверки", observed(function(row){return row.direct>0;}));
+    status("Последний ответ DNS", observed(function(row){return row.metrics[4][0]>0;}));
+    function actionCount(i) {
+      return detailed.reduce(function(total,row) {
+        return row.actions[i] == null ? total : (total || 0) + row.actions[i];
+      },null);
+    }
+    status("Действия в потоках с обменом · 8 мин.", "TCP "+networkValue(actionCount(0))+
+      " · UDP "+networkValue(actionCount(1)));
+  }
+  function renderNetwork(doc, report, range, chartsOnly) {
+    var data = doc.getElementById("network-diagnostic-data");
+    var list = doc.getElementById("network-diagnostic-incidents");
+    var charts = doc.getElementById("network-diagnostic-charts");
+    if (!data || !list || !charts) return;
+    data.hidden = !report;
+    if (!report) return;
+    var minutes = networkRows(report,true,report.minutes || []);
+    var detailed = networkRows(report,false,report.samples || []);
+    var daily = range === 24, rows = daily ? minutes : detailed;
+    charts.replaceChildren();
+    networkMetrics.forEach(function(_,i){charts.appendChild(renderNetworkChart(doc,rows,i,daily));});
+    setText(doc,"network-range-note",daily ?
+      "Минутные пики, суммы событий и минимум маршрутов. Вертикальные метки — аномалии." :
+      "Замеры каждые 2 секунды. Вертикальные метки — аномалии.");
+    if (chartsOnly) return;
+    renderNetworkOverview(doc,minutes,detailed);
+
+    var anomalies = doc.getElementById("network-diagnostic-anomalies");
+    var flagged = minutes.filter(function(row){return row.signals;}).reverse();
+    anomalies.querySelector("summary").textContent = "Аномалии за 24 часа · "+flagged.length+" мин.";
+    var anomalyList = doc.getElementById("network-anomaly-list");
+    anomalyList.replaceChildren();
+    flagged.forEach(function(row) {
+      var line = doc.createElement("p");
+      line.textContent = new Date(row.at * 1000).toLocaleString()+" · "+networkReasons(report,row.signals).join(", ");
+      anomalyList.appendChild(line);
+    });
+    if (!flagged.length) anomalyList.textContent = "Аномалии по критериям сборщика не зафиксированы.";
+
+    var expanded = Array.prototype.map.call(list.querySelectorAll("details[open]"),function(card){return card.dataset.trigger;});
     list.replaceChildren();
-    var incidents=report.incidents||[];
-    var labels=["Потеря маршрута IPv4","Потеря маршрута IPv6","Потеря линка IPv4",
-      "Потеря линка IPv6","Потери в NFQUEUE","Потери в conntrack"];
-    if (!incidents.length) list.textContent="Инцидентов пока нет.";
+    var incidents = report.incidents || [];
+    if (!incidents.length) list.textContent = "Инцидентов пока нет.";
     incidents.slice().reverse().forEach(function(event) {
-      var card=doc.createElement("details"), title=doc.createElement("summary");
-      card.dataset.trigger=String(event.trigger_ms);
-      var reasons=labels.filter(function(label,index){return event.signals&(1<<index);});
-      title.textContent=new Date(event.at*1000).toLocaleString()+" · "+reasons.join(", ")+
-        (event.complete?"":" · сбор продолжается");
+      var card = doc.createElement("details"), title = doc.createElement("summary"), time = doc.createElement("time");
+      card.className = "diag-card net-diag-event";
+      card.dataset.trigger = String(event.trigger_ms);
+      time.textContent = new Date(event.at*1000).toLocaleString();
+      title.append(time,doc.createTextNode(networkReasons(report,event.signals).join(", ")+
+        (event.complete ? "" : " · сбор продолжается")));
       card.appendChild(title);
-      var rows=event.samples||[], coverage=doc.createElement("p");
-      var before=rows.length?Math.max(0,(event.trigger_ms-rows[0][1])/1000):0;
-      var after=rows.length?Math.max(0,(rows[rows.length-1][1]-event.trigger_ms)/1000):0;
-      coverage.textContent="Охват: "+Math.floor(before)+" с до сигнала, "+Math.floor(after)+
-        " с после. Замеров: "+rows.length+".";
+      var samples = networkRows(report,false,event.samples || []), coverage = doc.createElement("p");
+      var before = samples.length ? Math.max(0,(event.trigger_ms-samples[0].mono)/1000) : 0;
+      var after = samples.length ? Math.max(0,(samples[samples.length-1].mono-event.trigger_ms)/1000) : 0;
+      coverage.className = "diag-history-note";
+      coverage.textContent = "Записано "+Math.floor(before)+" с до и "+Math.floor(after)+
+        " с после сигнала · "+samples.length+" замеров. Сигналы указывают на наблюдения, причина сбоя может быть другой.";
       card.appendChild(coverage);
       card.addEventListener("toggle",function(){
-        if (!card.open||card.querySelector("table")) return;
-        var table=doc.createElement("table"), head=table.createTHead().insertRow();
-        ["Смещение, с","WAN IPv4 / IPv6, маршруты","NFQUEUE, очередь","Conntrack, записей","Замеры в очереди"]
+        if (!card.open || card.querySelector("table")) return;
+        var table = doc.createElement("table"), head = table.createTHead().insertRow();
+        ["Смещение, с","Сигналы","Очередь, пакеты","Вердикт / цикл, мс","Потери NFQUEUE / netlink",
+          "Таймауты TCP / удержания / замеров","WAN IPv4 / IPv6","DNS без ответа","Действия TCP / UDP"]
           .forEach(function(label){var th=doc.createElement("th");th.textContent=label;head.appendChild(th);});
-        function num(value){return value==null?"—":value;}
-        var body=table.createTBody();
-        rows.forEach(function(row){
-          var tr=body.insertRow();
-          [(row[1]-event.trigger_ms)/1000,num(row[4][0])+" / "+num(row[5][0]),
-           num(row[6]&&row[6][6]),num(row[3][0]),num(row[7]&&row[7][4])]
+        var body = table.createTBody();
+        function pair(values) { return values.map(networkValue).join(" / "); }
+        samples.forEach(function(row) {
+          var tr = body.insertRow();
+          [(row.mono-event.trigger_ms)/1000,networkReasons(report,row.signals).join(", ") || "—",
+            networkValue(row.metrics[1][0]),pair([row.metrics[2][0],row.metrics[2][2]]),
+            pair(row.metrics[3]),pair(row.timeouts),pair(row.metrics[5]),networkValue(row.metrics[4][1]),pair(row.actions)]
             .forEach(function(value){tr.insertCell().textContent=value;});
         });
-        var scroller=doc.createElement("div");
-        scroller.className="diag-table-scroll";
+        var scroller = doc.createElement("div");
+        scroller.className = "diag-table-scroll";
+        scroller.tabIndex = 0;
         scroller.appendChild(table);
         card.appendChild(scroller);
       });
       list.appendChild(card);
-      card.open=expanded.indexOf(card.dataset.trigger)>=0;
+      card.open = expanded.indexOf(card.dataset.trigger) >= 0;
     });
   }
 
@@ -966,6 +1148,8 @@
     if (!toggle || !tgToggle || !status || !download) return;
     var netToggle=doc.getElementById("network-diagnostic-toggle");
     var netDownload=doc.getElementById("network-diagnostic-download");
+    var netCapture=doc.getElementById("network-diagnostic-capture");
+    var networkReport=null, networkRange=8, captureQueued=false, captureBaseline=0, captureDeadline=0;
     var networkEnabled=false, networkBusy=false, networkEpoch=0, networkToggleEpoch=0;
     var enabled = false, telegramEnabled = false, busy = false, range = 2, telegramRange = 2, currentReport = {};
     function redraw() { render(currentReport, enabled, range);renderTelegram(doc,currentReport.telegram_diagnostics,telegramEnabled,telegramRange); }
@@ -978,8 +1162,12 @@
       netToggle.textContent=networkEnabled?"Выключить и удалить историю":"Включить сбор";
       if (!networkEnabled) {
         netDownload.hidden=true;
+        if (netCapture) netCapture.disabled=true;
+        captureQueued=false;
+        networkReport=null;
+        setText(doc,"network-capture-status","");
         setText(doc,"network-diagnostic-status","Сбор выключен.");
-        renderNetwork(doc,{});
+        renderNetwork(doc,null,networkRange);
         return;
       }
       if (selectedTab!=="network") return;
@@ -988,11 +1176,22 @@
         return r.json();
       }).then(function(report){
         if (epoch!==networkEpoch) return;
+        networkReport=report;
         netDownload.hidden=!report;
+        if (netCapture) netCapture.disabled=!report||captureQueued;
         setText(doc,"network-diagnostic-status",report?
-          "Минутных сводок: "+report.minutes.length+". Подробных замеров: "+report.samples.length+".":
+          "Сбор включён · "+report.minutes.length+" мин. в сводке · "+report.samples.length+" подробных замеров":
           "Сбор включён. Данные пока недоступны или недостаточно свободной памяти.");
-        renderNetwork(doc,report||{});
+        if (captureQueued && report && report.manual_captured_ms>captureBaseline) {
+          captureQueued=false;
+          if (netCapture) netCapture.disabled=false;
+          setText(doc,"network-capture-status","Отметка сохранена.");
+        } else if (captureQueued && Date.now()>=captureDeadline) {
+          captureQueued=false;
+          if (netCapture) netCapture.disabled=!report;
+          setText(doc,"network-capture-status","Подтверждение ещё не получено. Проверьте список инцидентов.");
+        }
+        renderNetwork(doc,report,networkRange);
       }).catch(function(){
         if (epoch===networkEpoch) setText(doc,"network-diagnostic-status","Не удалось прочитать сетевой отчёт.");
       });
@@ -1016,6 +1215,15 @@
         range = Number(button.dataset.memoryRange);
         doc.querySelectorAll("[data-memory-range]").forEach(function (item) { item.setAttribute("aria-pressed", String(item === button)); });
         redraw();
+      });
+    });
+    doc.querySelectorAll("[data-network-range]").forEach(function(button) {
+      button.addEventListener("click",function(){
+        networkRange=Number(button.dataset.networkRange);
+        doc.querySelectorAll("[data-network-range]").forEach(function(item){
+          item.setAttribute("aria-pressed",String(item===button));
+        });
+        renderNetwork(doc,networkReport,networkRange,true);
       });
     });
     doc.querySelectorAll("[data-memory-series]").forEach(function (input) { input.addEventListener("change", redraw); });
@@ -1075,13 +1283,33 @@
           setText(doc,"network-diagnostic-status","Не удалось переключить сетевой сбор.");
         }).finally(function(){networkBusy=false;netToggle.disabled=false;});
     });
+    if (netCapture) netCapture.addEventListener("click",function(){
+      if (!networkEnabled || networkBusy || captureQueued) return;
+      networkBusy=true;
+      netCapture.disabled=true;
+      netToggle.disabled=true;
+      captureBaseline=networkReport ? networkReport.manual_captured_ms || 0 : 0;
+      ++networkEpoch;
+      setText(doc,"network-capture-status","Сохраняем отметку…");
+      root.fetch("/api/diagnostics?network-capture",{method:"POST",cache:"no-store"}).then(function(r){
+        if (!r.ok) throw new Error("HTTP "+r.status);
+        captureQueued=true;
+        captureDeadline=Date.now()+20000;
+        setText(doc,"network-capture-status","Отметка принята. Ожидаем ближайший замер.");
+        refreshNetwork();
+      }).catch(function(){
+        netCapture.disabled=false;
+        setText(doc,"network-capture-status","Не удалось зафиксировать сбой. Попробуйте ещё раз.");
+      }).finally(function(){networkBusy=false;netToggle.disabled=false;});
+    });
     selectTab("general",false);
     refresh();
     var lastRefresh=Date.now();
     root.setInterval(function () {
       var waiting=selectedTab==="telegram"&&telegramEnabled&&
         !(currentReport.telegram_diagnostics||{}).latest;
-      if (!busy&&!networkBusy&&!doc.hidden&&selectedTab==="network"&&networkEnabled&&netDownload&&netDownload.hidden&&Date.now()-lastRefresh<60000) refreshNetwork();
+      if (!busy&&!networkBusy&&!doc.hidden&&selectedTab==="network"&&networkEnabled&&netDownload&&
+          (netDownload.hidden||captureQueued)&&Date.now()-lastRefresh<60000) refreshNetwork();
       if(!busy&&!networkBusy&&!doc.hidden&&(waiting||Date.now()-lastRefresh>=60000)){
         lastRefresh=Date.now();
         refresh();

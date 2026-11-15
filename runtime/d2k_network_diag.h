@@ -11,6 +11,7 @@ typedef struct d2k_network_controller {
     uint64_t queue_expired, phase_deadlines, tcp_dial_deadlines;
     uint64_t dns_checks, dns_failures, dns_local_failures, dns_bootstrap_failures, dns_config_failures;
     uint64_t dns_config_max_ms;
+    uint64_t dns_valid_replies, direct_verified;
 } d2k_network_controller;
 
 typedef struct {
