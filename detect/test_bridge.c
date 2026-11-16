@@ -441,12 +441,15 @@ int main(void)
         d2k_base_seed seed;
         memset(&seed, 0, sizeof seed);
         seed.valid = 1; seed.repeats = 2; seed.pass = 0; seed.fail = 2;
+        seed.prior_live_tls_no_reply = 1;
         memset(&answer, 0, sizeof answer);
         answer.verdict = D2K_DV_PREFIX;
         progress_reset();
         r = d2k_detect_sched_tcp_seeded("192.0.2.1", 443, tr, none, 0x2d, 2, 12000, 321, NULL, &seed);
         CHECK(seen.seed_whole == 1 && seen.seed_repeats == 2 && seen.seed_pass == 0 &&
-              seen.seed_fail == 2 && r.verdict == D2K_V_PREFIX);
+              seen.seed_fail == 2 && seen.prior_live_tls_no_reply == 1 &&
+              r.verdict == D2K_V_PREFIX);
+        seed.prior_live_tls_no_reply = 0;
         snprintf(seed.err, sizeof seed.err, "dial tcp 192.0.2.1:443: i/o timeout");
         r = d2k_detect_sched_tcp_seeded("192.0.2.1", 443, tr, none, 0x2d, 2, 12000, 321, NULL, &seed);
         CHECK(!seen.seed_whole); /* even an old valid timeout seed must be remeasured */

@@ -2021,7 +2021,7 @@ static d2k_vres stub_base(const char *ip, uint16_t port, d2k_hello trigger,
 }
 
 /* Полный прогон с ответом базы: сколько раз позван и с каким ответом. */
-static int seeded_calls, seeded_pass, seeded_fail;
+static int seeded_calls, seeded_pass, seeded_fail, seeded_live_tls_no_reply;
 static d2k_vres stub_tcp_seeded(const char *ip, uint16_t port, d2k_hello trigger,
                                 d2k_hello control, uint32_t mark, int repeats,
                                 uint32_t gap_us, uint32_t wait_ms,
@@ -2029,6 +2029,7 @@ static d2k_vres stub_tcp_seeded(const char *ip, uint16_t port, d2k_hello trigger
     seeded_calls++;
     seeded_pass = seed ? seed->pass : -1;
     seeded_fail = seed ? seed->fail : -1;
+    seeded_live_tls_no_reply = seed ? seed->prior_live_tls_no_reply : 0;
     return stub_tcp(ip, port, trigger, control, mark, repeats, gap_us, wait_ms, stop);
 }
 /* Полный прогон С ОТВЕТОМ БАЗЫ И ECH-ПРИМАНКОЙ (поле ac4edeb): у целей
@@ -14376,6 +14377,35 @@ own_first_test:
         ver_fail_first = 0; ver_unsupported = 0; ver_cloudflare_challenge = 0;
         vol_answer = D2K_VOL_PASSED; vol_rx_cut = 0; vol_rx_tls_unavailable = 0;
         snapshot_enabled = 0;
+
+        /* Live unplanned TLS no-reply events are order hints even when cold
+           start has not captured an exact ClientHello shape. */
+        {
+            d2k_sched_tcp_fn saved_tcp = d2k_sched_tcp_hook;
+            d2k_sched_tcp_seeded_fn saved_seeded = d2k_sched_tcp_seeded_hook;
+            const uint8_t codes[] = {D2K_SUSPECT_REPEAT, D2K_SUSPECT_SILENT};
+            d2k_sched_tcp_hook = stub_tcp;
+            d2k_sched_tcp_seeded_hook = stub_tcp_seeded;
+            tcp_answer = D2K_V_OPAQUE; tcp_owns_search = 0;
+            for (size_t i = 0; i < sizeof codes / sizeof codes[0]; i++) {
+                d2k_catalog c = {0};
+                uint16_t port = (uint16_t)(42091 + i);
+                d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+                d2k_sched_set_say(s, collect_say, NULL);
+                seeded_calls = tcp_calls = 0; seeded_live_tls_no_reply = 0;
+                d2k_ev h = ev_hello(6, port, "repeat-flow.example"); h.family = 4;
+                d2k_sched_event(s, &h);
+                d2k_ev su = ev_suspect(6, port); su.family = 4;
+                su.code = codes[i]; su.planned = D2K_LINK_PLANNED_NO;
+                d2k_sched_event(s, &su);
+                settle(s); spin(s, 40);
+                CHECK(seeded_calls == 1 && seeded_live_tls_no_reply == 1,
+                      "cold live TLS no-reply order hint missed classifier");
+                d2k_sched_free(s); d2k_catalog_free(&c);
+            }
+            d2k_sched_tcp_hook = saved_tcp;
+            d2k_sched_tcp_seeded_hook = saved_seeded;
+        }
 
         /* (a) Свой план другой цели подтверждается собственным зондом раньше
            полного замера: классификатор не зовётся, привязка ложится под

@@ -234,6 +234,7 @@ typedef struct {
     int  delay_ms;
     int  pass;
     int  fail;
+    int  live_fail;
     char err[160];
 } d2k_obs;
 
@@ -266,6 +267,7 @@ typedef struct {
     int           repeats;
     int           probes;
     long          duration_ms;
+    int           live_tls_failures;
 
     /* Замер БРОШЕН по требованию вызывающего: то, что успели измерить, верно,
      * но дерево пройдено не до конца. Вердикт такого прогона не утверждает
@@ -397,6 +399,7 @@ typedef struct {
     int  seed_repeats;
     int  seed_pass;
     int  seed_fail;
+    int  prior_live_tls_no_reply;
     char seed_err[160];
 } d2k_opts;
 

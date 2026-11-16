@@ -177,6 +177,9 @@ static void print_json(const d2k_result *r)
             printf(",\n      \"delay_ms\": %d", o->delay_ms);
         }
         printf(",\n      \"pass\": %d,\n      \"fail\": %d", o->pass, o->fail);
+        if (o->live_fail) {
+            printf(",\n      \"live_fail\": %d", o->live_fail);
+        }
         if (o->err[0]) {
             printf(",\n      \"err\": ");
             print_json_str(o->err);
@@ -269,8 +272,10 @@ static void print_human(const d2k_result *r, const d2k_trigger *tr)
             }
             snprintf(cuts + k, sizeof(cuts) - (size_t)k, "]");
         }
-        printf("  %-11s cuts=%-8s пауза=%dмс  прошло=%d не прошло=%d %s\n",
-               o->probe, cuts, o->delay_ms, o->pass, o->fail, o->err);
+        printf("  %-11s cuts=%-8s пауза=%dмс  прошло=%d не прошло=%d",
+               o->probe, cuts, o->delay_ms, o->pass, o->fail);
+        if (o->live_fail) { printf(" живой отказ=%d", o->live_fail); }
+        printf(" %s\n", o->err);
     }
 }
 
