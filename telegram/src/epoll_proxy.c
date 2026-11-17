@@ -1680,8 +1680,11 @@ static int begin_upstream(proxy_connection *connection,
     connection->upstream_fd = fd;
     int rc = connect(fd, (struct sockaddr *)&address, length);
     if (rc != 0 && errno != EINPROGRESS) {
+        int error = errno;
         close(fd);
         connection->upstream_fd = -1;
+        if (target->family == AF_INET6 && error == ENETUNREACH)
+            return -ENETUNREACH;
         return -1;
     }
     connection->connecting = rc != 0;
@@ -1714,6 +1717,24 @@ static int begin_upstream(proxy_connection *connection,
         return -1;
     }
     return 0;
+}
+
+static int begin_wss_upstream(proxy_connection *connection,
+                              const tg_listener_destination *target) {
+    int rc = begin_upstream(connection, target);
+    if (rc != -ENETUNREACH || connection->route_kind != TG_ROUTE_CF_PROXY)
+        return rc;
+    /* A local IPv6 routing failure says nothing about the KWS endpoint. */
+    for (size_t i = 1; i < TG_ROUTE_DNS_ADDRESS_MAX; ++i) {
+        tg_listener_destination alternate;
+        if (resolve_route_domain(connection->server, connection->tls_hostname,
+                                 &alternate) != 0)
+            break;
+        if (alternate.family == AF_INET)
+            return begin_upstream(connection, &alternate);
+        if (memcmp(alternate.address, target->address, 16) == 0) break;
+    }
+    return -1;
 }
 
 static void clear_wss_state(proxy_connection *connection) {
@@ -2061,7 +2082,7 @@ static int start_next_route(proxy_connection *connection) {
         connection->direct_wss = 1;
         connection->wss_phase = WSS_NONE;
         ++server->active_wss_connections;
-        if (begin_upstream(connection, &target) == 0) {
+        if (begin_wss_upstream(connection, &target) == 0) {
             if (!connection->connecting)
                 route_session_event(connection, step.kind,
                                     TG_ROUTE_SESSION_CONNECTED);
@@ -2283,7 +2304,7 @@ static int hedge_launch_next(proxy_connection *parent) {
         candidate->wss_phase = WSS_NONE;
         parent->hedges[slot] = candidate;
         ++server->active_wss_connections;
-        if (begin_upstream(candidate, &candidate->upstream_target) == 0) {
+        if (begin_wss_upstream(candidate, &candidate->upstream_target) == 0) {
             route_session_event(candidate, step.kind,
                                 TG_ROUTE_SESSION_CONNECTING);
             if (!candidate->connecting)

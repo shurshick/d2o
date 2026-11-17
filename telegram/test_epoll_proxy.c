@@ -40,6 +40,9 @@ static int hold_pending_connect;
 static int pending_connect_fd = -1;
 static uint16_t counted_connect_port;
 static unsigned counted_connect_attempts;
+static const struct in6_addr unreachable_cf_ipv6 = {
+    .s6_addr = {0x20, 0x01, 0x0d, 0xb8, [15] = 0xcf}
+};
 
 int __real_connect(int fd, const struct sockaddr *address, socklen_t length);
 int __real_epoll_ctl(int epoll_fd, int operation, int fd,
@@ -73,6 +76,12 @@ int __wrap_clock_gettime(clockid_t clock_id, struct timespec *time) {
 }
 
 int __wrap_connect(int fd, const struct sockaddr *address, socklen_t length) {
+    if (address && address->sa_family == AF_INET6 &&
+        memcmp(&((const struct sockaddr_in6 *)address)->sin6_addr,
+               &unreachable_cf_ipv6, sizeof(unreachable_cf_ipv6)) == 0) {
+        errno = ENETUNREACH;
+        return -1;
+    }
     if (address && address->sa_family == AF_INET && counted_connect_port &&
         ntohs(((const struct sockaddr_in *)address)->sin_port) ==
             counted_connect_port)
@@ -103,6 +112,7 @@ typedef struct {
     tg_listener_destination direct_upstream;
     tg_listener_destination worker_upstream;
     tg_listener_destination cf_proxy_b_upstream;
+    tg_listener_destination cf_proxy_first_ipv6;
     pthread_mutex_t *original_mutex;
     size_t routes;
     size_t resolve_calls;
@@ -281,6 +291,10 @@ static int resolve_test_route_domain(void *opaque, const char *domain,
                                      tg_listener_destination *out) {
     proxy_fixture *fixture = opaque;
     ++fixture->resolve_calls;
+    if (fixture->cf_proxy_first_ipv6.family == AF_INET6 && fixture->resolve_calls == 1) {
+        *out = fixture->cf_proxy_first_ipv6;
+        return 0;
+    }
     if (strcmp(domain, "kws4-1.cfproxy-a.test") == 0 ||
         strcmp(domain, "kws4.cfproxy-a.test") == 0) {
         ++fixture->cf_proxy_a_resolve_calls;
@@ -2567,7 +2581,8 @@ static void test_async_route_dns_waits_before_worker(void) {
     assert(rmdir(directory) == 0);
 }
 
-static void test_epoll_cf_proxy_preserves_media_dc_hostname_and_framing(int ios_prefix) {
+static void test_epoll_cf_proxy_preserves_media_dc_hostname_and_framing(
+    int ios_prefix, int ipv6_unreachable, tg_ws_routing_policy policy) {
     char directory[] = "/tmp/d2k-tg-cf-proxy-XXXXXX";
     char cert_path[256], key_path[256];
     assert(mkdtemp(directory) != NULL);
@@ -2626,10 +2641,12 @@ static void test_epoll_cf_proxy_preserves_media_dc_hostname_and_framing(int ios_
     proxy_fixture fixture = {0};
     set_ipv4(&fixture.original, ios_prefix ? "149.154.167.151" : "149.154.167.51", 443);
     set_ipv4(&fixture.upstream, "127.0.0.1", ws_port);
+    if (ipv6_unreachable) set_ipv6(&fixture.cf_proxy_first_ipv6, "2001:db8::cf", ws_port);
     SSL_CTX *tls_context = tg_tls_client_context(cert_path);
     assert(tls_context);
     tg_config routing = {0};
-    routing.ws_routing = TG_WS_ROUTING_CF_FIRST;
+    routing.ws_routing = policy;
+    routing.ws_hedge_limit = 1;
     routing.cf_proxy_domain_count = 1;
     memcpy(routing.cf_proxy_domains[0], "cfproxy.test", sizeof("cfproxy.test"));
     const uint16_t ports[] = {443};
@@ -2646,6 +2663,7 @@ static void test_epoll_cf_proxy_preserves_media_dc_hostname_and_framing(int ios_
         .handshake_timeout_ms = 3000,
         .idle_timeout_ms = 5000,
         .enable_direct_wss = 1,
+        .cloudflare_only = 1,
         .tls_context = tls_context,
         .routing_config = &routing,
         .resolve_domain = resolve_test_route_domain,
@@ -2694,6 +2712,7 @@ static void test_epoll_cf_proxy_preserves_media_dc_hostname_and_framing(int ios_
     assert(tg_epoll_proxy_get_stats(proxy, &route_stats) == 0);
     assert(route_stats.wss_attempts == 1 && route_stats.wss_responses == 1 &&
            route_stats.cf_wss_responses == 1);
+    assert(fixture.resolve_calls == (ipv6_unreachable ? 2u : 1u));
     tg_epoll_proxy_destroy(proxy);
     close(listener);
     close(cf_proxy.listener);
@@ -3894,7 +3913,11 @@ static void test_media_after_low_memory_start(size_t media_chunks) {
 int main(int argc, char **argv) {
     (void)signal(SIGPIPE, SIG_IGN);
     if (argc == 2 && strcmp(argv[1], "ios-media") == 0) {
-        test_epoll_cf_proxy_preserves_media_dc_hostname_and_framing(1);
+        test_epoll_cf_proxy_preserves_media_dc_hostname_and_framing(1, 0, TG_WS_ROUTING_CF_FIRST);
+        return 0;
+    }
+    if (argc == 2 && strcmp(argv[1], "ipv4-media-retry") == 0) {
+        test_epoll_cf_proxy_preserves_media_dc_hostname_and_framing(1, 1, TG_WS_ROUTING_CF_FIRST);
         return 0;
     }
     if (argc == 2 && strcmp(argv[1], "auto-capacity") == 0) {
@@ -3961,8 +3984,10 @@ int main(int argc, char **argv) {
     test_epoll_cf_worker_uses_raw_stream_framing(0, 0, 0, 4, "149.154.167.43", 1, 1024);
     test_epoll_wss_sends_ping();
     test_async_route_dns_waits_before_worker();
-    test_epoll_cf_proxy_preserves_media_dc_hostname_and_framing(0);
-    test_epoll_cf_proxy_preserves_media_dc_hostname_and_framing(1);
+    test_epoll_cf_proxy_preserves_media_dc_hostname_and_framing(0, 0, TG_WS_ROUTING_CF_FIRST);
+    test_epoll_cf_proxy_preserves_media_dc_hostname_and_framing(1, 0, TG_WS_ROUTING_CF_FIRST);
+    test_epoll_cf_proxy_preserves_media_dc_hostname_and_framing(1, 1, TG_WS_ROUTING_CF_FIRST);
+    test_epoll_cf_proxy_preserves_media_dc_hostname_and_framing(1, 1, TG_WS_ROUTING_ADAPTIVE);
     test_epoll_reuses_confirmed_media_route_across_ips();
     test_epoll_cools_down_cf_proxy_after_dns_failure();
     test_wss_partial_frame_before_response_advances_route();
