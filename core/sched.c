@@ -9434,6 +9434,36 @@ static int partial_finish(d2k_sched *s, task *t, int64_t now_ms);
    отказ нельзя — частичный результат записывается сразу (отметка «оборван»,
    повторная проверка после отдыха), объёмный блок остаётся открытым. */
 static void budget_cut_reject(d2k_sched *s, task *t, int64_t now_ms) {
+    int neutral_root_404 = t->transport == 6 &&
+        t->ver.level == D2K_VER_APPLICATION && t->ver.status == 404 &&
+        t->ver.http_outcome == D2K_HTTP_NEUTRAL;
+    int confirmed_binding = 0;
+    if (neutral_root_404 && t->search_owned && s->cat) {
+        uint8_t shape = record_shape(t);
+        for (size_t bi = 0; bi < s->cat->n_boxes && !confirmed_binding; bi++) {
+            const d2k_cat_box *b = &s->cat->boxes[bi];
+            for (size_t j = 0; j < b->n_binds; j++) {
+                const d2k_cat_binding *bd = &b->binds[j];
+                if (bd->enabled && bd->level >= 3 && !strcmp(bd->target, t->name) &&
+                    !strcmp(bd->kind, t->by_addr ? "addr" : "name") &&
+                    (bd->transport ? bd->transport : 6) == t->transport &&
+                    (bd->family ? bd->family : 4) == t->family && bd->shape == shape) {
+                    confirmed_binding = 1;
+                    break;
+                }
+            }
+        }
+    }
+    if (neutral_root_404 && (confirmed_binding ||
+        (t->rx_bootstrap_only && t->trigger_code == D2K_SUSPECT_RST_AFTER_APP))) {
+        say(s, "по %s корневая проба ответила нейтральным HTTP 404; бюджет потока "
+               "не измерен — подтверждённую привязку сохраняю, общий перебор не запускаю",
+            t->name);
+        search_report(s, t, now_ms, "inconclusive", "root-404-unmeasured");
+        cooldown_record(s, t, 3);
+        task_fail(s, t, now_ms);
+        return;
+    }
     char cut_id[40]; uint8_t cut_wire[D2K_PLAN_ID_LEN];
     plan_ident(t->plans[t->next_plan - 1], cut_id, sizeof cut_id, cut_wire);
     /* Объёмный обрыв этой цели измерен — остановка потока принадлежит ему. */
@@ -9453,22 +9483,25 @@ static void budget_cut_reject(d2k_sched *s, task *t, int64_t now_ms) {
         t->name, cut_id, t->next_plan, t->ver.status, t->ver.budget_note,
         t->budget_pk, t->budget_src);
     }
-    uint8_t shape = record_shape(t);
-    for (size_t bi = 0; s->cat && bi < s->cat->n_boxes; bi++) {
-        d2k_cat_box *b = &s->cat->boxes[bi];
-        for (size_t j = 0; j < b->n_binds; j++) {
-            d2k_cat_binding *bd = &b->binds[j];
-            if (strcmp(bd->plan_id, cut_id) || strcmp(bd->target, t->name) ||
-                strcmp(bd->kind, t->by_addr ? "addr" : "name") ||
-                (bd->transport ? bd->transport : 6) != t->transport ||
-                (bd->family ? bd->family : 4) != t->family || bd->shape != shape ||
-                bd->budget == D2K_CAT_BUDGET_CUT) continue;
-            say(s, "по %s привязка плана %s коробки %s: отметка бюджета «%s» → «оборван»",
-                t->name, cut_id, b->id, bd->budget == D2K_CAT_BUDGET_PASSED ? "пройден" :
-                bd->budget == D2K_CAT_BUDGET_UNCHECKED ? "не проверен" : "нет");
-            bd->budget = D2K_CAT_BUDGET_CUT;
-            s->cat->revision++;
-            s->sync_pending = 1;
+    /* Нейтральный 404 корневой пробы не измеряет бюджет потока; привязку не портим. */
+    if (!neutral_root_404) {
+        uint8_t shape = record_shape(t);
+        for (size_t bi = 0; s->cat && bi < s->cat->n_boxes; bi++) {
+            d2k_cat_box *b = &s->cat->boxes[bi];
+            for (size_t j = 0; j < b->n_binds; j++) {
+                d2k_cat_binding *bd = &b->binds[j];
+                if (strcmp(bd->plan_id, cut_id) || strcmp(bd->target, t->name) ||
+                    strcmp(bd->kind, t->by_addr ? "addr" : "name") ||
+                    (bd->transport ? bd->transport : 6) != t->transport ||
+                    (bd->family ? bd->family : 4) != t->family || bd->shape != shape ||
+                    bd->budget == D2K_CAT_BUDGET_CUT) continue;
+                say(s, "по %s привязка плана %s коробки %s: отметка бюджета «%s» → «оборван»",
+                    t->name, cut_id, b->id, bd->budget == D2K_CAT_BUDGET_PASSED ? "пройден" :
+                    bd->budget == D2K_CAT_BUDGET_UNCHECKED ? "не проверен" : "нет");
+                bd->budget = D2K_CAT_BUDGET_CUT;
+                s->cat->revision++;
+                s->sync_pending = 1;
+            }
         }
     }
     /* ЧАСТИЧНЫЙ ОБХОД — лучший запоминается (больше пакетов до обрыва, затем
@@ -9488,6 +9521,13 @@ static void budget_cut_reject(d2k_sched *s, task *t, int64_t now_ms) {
         snprintf(t->partial_box, sizeof t->partial_box, "%s", t->box_id);
         t->partial_ver = t->ver;
         t->partial_ver.fd = -1;
+    }
+    /* A generic root 404 says nothing about the target application's volume. */
+    if (neutral_root_404 && t->search_owned && t->partial_valid) {
+        say(s, "по %s корневая проба получила нейтральный HTTP 404; объёмный бюджет "
+               "этим ответом не измерен — прекращаю перебор, сохраняю только частичный "
+               "результат", t->name);
+        if (partial_finish(s, t, now_ms)) return;
     }
     /* Объёмный блок измерен: перебирать планы дальше по ЭТОМУ отказу нечем —
        каждый следующий кандидат получит тот же обрыв от того же блока, и

@@ -10363,6 +10363,7 @@ rx_volume_tests:
             snprintf(bd->plan_id, sizeof bd->plan_id, "plan-late-boot");
             bd->enabled = 1; bd->level = 3; bd->transport = 6;
             bd->shape = D2K_SHAPE_MODERN; bd->family = 4;
+            bd->budget = D2K_CAT_BUDGET_PASSED;
             d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
             saidbuf[0] = '\0'; forget_sent();
             d2k_sched_set_say(s, collect_say, NULL);
@@ -10395,6 +10396,51 @@ rx_volume_tests:
             CHECK(tcp_calls >= 1,
                   "после неудачи своего плана позднего закрытия не запущен полный замер");
             d2k_sched_free(s);
+
+            /* A saved application route may have no generic root page. Its
+               complete 404 cannot condemn the confirmed plan or justify
+               searching every fallback. */
+            s = d2k_sched_new(&c, sv[0], 0x2d);
+            CHECK(s != NULL, "late 404 bootstrap scheduler allocation failed");
+            if (s) {
+                saidbuf[0] = '\0'; forget_sent();
+                d2k_sched_set_say(s, collect_say, NULL);
+                vol_calls = tcp_calls = ver_calls = 0;
+                vol_answer = D2K_VOL_UNREACHABLE; vol_rx_tls_unavailable = 1;
+                ver_answer = D2K_VER_APPLICATION; ver_answer_port = 40252;
+                ver_fail_first = 0; ver_budget_n = 1;
+                ver_budget_seq[0] = D2K_BUDGET_CUT; ver_budget_status = 404;
+                memset(ver_budget_seen, 0, sizeof ver_budget_seen);
+                h = ev_hello(6, 40252, "late-boot-fails.test");
+                d2k_sched_event(s, &h);
+                CHECK(tls_shape_event(&sh, h.name, D2K_SHAPE_MODERN) == 0,
+                      "late 404 shape fixture failed");
+                d2k_sched_event(s, &sh);
+                su = ev_suspect(6, 40252);
+                su.code = D2K_SUSPECT_RST_AFTER_APP;
+                su.planned = D2K_LINK_PLANNED_YES;
+                d2k_sched_event(s, &su);
+                installed = 0;
+                for (int i = 0; i < 4000 && !said("корневая проба ответила нейтральным HTTP 404"); i++) {
+                    tick_once(s);
+                    int n = sent_command_count(D2K_CMD_SET_NAME_PROBE, NULL, 0);
+                    if (n > installed) {
+                        installed = n;
+                        d2k_ev ap = ev_applied(6, 40252);
+                        d2k_sched_event(s, &ap);
+                    }
+                }
+                CHECK(ver_calls >= 1 && ver_budget_seen[0] == 25,
+                      "late 404 bootstrap did not exercise the saved-plan budget probe");
+                CHECK(said("подтверждённую привязку сохраняю, общий перебор не запускаю"),
+                      "late 404 bootstrap was treated as plan failure");
+                CHECK(tcp_calls == 0 && !said("из запасного перебора"),
+                      "late 404 bootstrap launched a fallback search");
+                CHECK(c.boxes[0].binds[0].budget != D2K_CAT_BUDGET_CUT,
+                      "late 404 bootstrap downgraded its confirmed binding");
+                d2k_sched_free(s);
+            }
+            ver_budget_n = 0; ver_budget_status = 200;
         }
         d2k_catalog_free(&c);
         vol_rx_tls_unavailable = 0; vol_answer = D2K_VOL_PASSED;
@@ -15794,15 +15840,16 @@ own_first_test:
            (p1) Ничего лучше нет — частичный подтверждается с отметкой «оборван»
            (3), «частичный обход» в журнале, ставится на провод.
            (p2) После частичного нашёлся проходящий бюджет — берётся он.
-           (p3) Оборванный бюджетом замеренный приём не отправляет цель на
-           отдых: дальше идут запасные кандидаты оригинала. */
-        for (int variant = 0; variant < 2; variant++) {
+           (p3) Нейтральный 404 на корневой пробе не оправдывает перебор: он не
+           измеряет объём целевого приложения, поэтому остаётся лишь частичный. */
+        for (int variant = 0; variant < 3; variant++) {
             d2k_catalog c = {0};
             tcp_owns_search = 1; tcp_found_arm = 0; tcp_answer = D2K_V_PREFIX;
             ver_answer = D2K_VER_APPLICATION; ver_fail_first = 0;
             ver_app_after_tcp_search = 0; base_blocked_answer = 1;
             ver_budget_n = 2; ver_budget_seq[0] = D2K_BUDGET_CUT;
-            ver_budget_seq[1] = D2K_BUDGET_PASSED; ver_budget_status = 404;
+            ver_budget_seq[1] = D2K_BUDGET_PASSED;
+            ver_budget_status = variant == 2 ? 404 : 200;
             ver_fail_after = variant == 0 ? 1 : 0;
             d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
             saidbuf[0] = '\0';
@@ -15811,7 +15858,8 @@ own_first_test:
             base_calls = tcp_calls = ver_calls = vol_calls = 0;
             uint16_t port = (uint16_t)(42340 + variant);
             ver_answer_port = port;
-            const char *name = variant ? "updates2.partial.own" : "updates.partial.own";
+            const char *name = variant == 0 ? "updates.partial.own" :
+                               variant == 1 ? "updates2.partial.own" : "updates3.partial.own";
             d2k_ev h = ev_hello(6, port, name); d2k_sched_event(s, &h);
             d2k_ev su = ev_suspect(6, port); d2k_sched_event(s, &su);
             for (int i = 0; i < 400 && !said("ПОДТВЕРЖДЕНО") && !said("цель отдыхает"); i++) {
@@ -15819,8 +15867,14 @@ own_first_test:
                 d2k_ev ap = ev_applied(6, port); d2k_sched_event(s, &ap);
                 spin(s, 2);
             }
-            CHECK(ver_calls >= 2 && said("запасного перебора"),
-                  "partial: оборванный бюджетом замеренный приём кончил поиск (не пошли запасные)");
+            if (variant < 2) {
+                CHECK(ver_calls >= 2 && said("запасного перебора"),
+                      "partial: non-404 budget cut stopped before fallback");
+            } else {
+                CHECK(ver_calls == 1 && !said("запасного перебора") &&
+                      said("корневая проба получила нейтральный HTTP 404"),
+                      "partial 404: search continued after the root probe could not measure app volume");
+            }
             const d2k_cat_binding *bd = binding_of(&c, name, 6);
             if (variant == 0) {
                 CHECK(bd && bd->budget == D2K_CAT_BUDGET_CUT && said("частичный обход: рукопожатие снято") &&
@@ -15830,9 +15884,14 @@ own_first_test:
                 drain(); forget_sent(); d2k_sched_sync(s); sync_out(s);
                 CHECK(sent_command_count(D2K_CMD_SET_NAME, NULL, 0) >= 1,
                       "partial: частичный обход не поставлен на провод");
-            } else {
+            } else if (variant == 1) {
                 CHECK(bd && bd->budget == D2K_CAT_BUDGET_PASSED && !said("частичный обход: рукопожатие снято"),
                       "partial: частичный выбран вместо прошедшего бюджет");
+            } else {
+                CHECK(said("частичный обход: рукопожатие снято"),
+                      "partial 404: inconclusive root response was treated as a complete bypass");
+                CHECK(bd && bd->budget == D2K_CAT_BUDGET_CUT && said("частичный обход: рукопожатие снято"),
+                      "partial 404: best measured partial was not kept as partial");
             }
             if (fails || getenv("T55_SHOW")) fprintf(stderr, "%s\n", saidbuf);
             d2k_sched_free(s); d2k_catalog_free(&c);
