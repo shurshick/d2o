@@ -784,6 +784,8 @@ static int route_health_key_matches(const route_health *health,
         (a->family != AF_INET && a->family != AF_INET6) ||
         (b->family != AF_INET && b->family != AF_INET6))
         return 0;
+    /* CF Proxy routes by KWS Host and DC, independent of the original IP. */
+    if (health->kind == TG_ROUTE_CF_PROXY) return 1;
     if (a->family != b->family) return 0;
     size_t address_len = a->family == AF_INET ? 4u : 16u;
     return memcmp(a->address, b->address, address_len) == 0;

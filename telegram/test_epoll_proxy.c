@@ -3010,6 +3010,9 @@ static void test_epoll_cools_down_cf_proxy_after_dns_failure(void) {
     assert(fixture.cf_proxy_a_resolve_calls == 3 &&
            fixture.cf_proxy_b_resolve_calls == 1);
 
+    /* Retry the same KWS route from a different original Telegram IP. */
+    routing.ws_routing = TG_WS_ROUTING_CF_FIRST;
+    set_ipv4(&fixture.original, "149.154.167.43", 443);
     atomic_store(&runner.stop, 0);
     assert(pthread_create(&proxy_thread, NULL, run_proxy, &runner) == 0);
     exchange_wss_test_fixture(proxy_port, handshake, &route_b);
