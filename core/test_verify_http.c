@@ -355,6 +355,74 @@ static int budget_checks(void) {
             fprintf(stderr, "gateway accepted nested op=10 instead of top-level op=9\n"); fails++;
         }
     }
+    /* KWS uses the Telegram client's WebSocket protocol at /apiws. A neutral
+       404 from GET / says nothing about whether that route accepts an upgrade. */
+    {
+        static const char upgraded[] =
+            "HTTP/1.1 101 Switching Protocols\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            "Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n"
+            "Sec-WebSocket-Protocol: binary\r\n\r\n";
+        static const char *const kws_hosts[] = {
+            "kws2.example.test", "kws2-1.example.test", "kws999.example.test"
+        };
+        for (size_t i = 0; i < sizeof kws_hosts / sizeof kws_hosts[0]; i++) {
+            gateway_fixture g; memset(&g, 0, sizeof g);
+            g.stream.reply = upgraded; g.stream.fragment = 5; g.stream.len = sizeof upgraded - 1;
+            d2k_ver_result r = {0}; char err[200] = "";
+            r.level = D2K_VER_HANDSHAKE;
+            request_page_budget(gateway_read, gateway_write, &g, kws_hosts[i], 2, NULL,
+                                60, 0, NULL, D2K_BUDGET_FIELD_PACKETS, &r, err, sizeof err);
+            char expected_host[96];
+            snprintf(expected_host, sizeof expected_host, "Host: %s", kws_hosts[i]);
+            if (r.level != D2K_VER_HANDSHAKE || r.handshake_proof ||
+                !r.websocket_upgrade_proof || r.status != 101 ||
+                r.body_complete || r.budget != D2K_BUDGET_NOT_APPLICABLE || g.writes != 1 ||
+                !strstr(g.request, "GET /apiws HTTP/1.1") ||
+                !strstr(g.request, "Sec-WebSocket-Protocol: binary") ||
+                !strstr(g.request, "Origin: https://web.telegram.org") ||
+                !strstr(g.request, expected_host)) {
+                fprintf(stderr, "KWS upgrade proof %s: level %d handshake %d status %d complete %d budget %d [%s]\n",
+                        kws_hosts[i], r.level, r.websocket_upgrade_proof, r.status, r.body_complete,
+                        r.budget, r.reason); fails++;
+            }
+        }
+        char wrong_protocol[sizeof upgraded]; memcpy(wrong_protocol, upgraded, sizeof upgraded);
+        char *protocol = strstr(wrong_protocol, "binary");
+        assert(protocol); protocol[0] = 'x';
+        gateway_fixture g; memset(&g, 0, sizeof g);
+        g.stream.reply = wrong_protocol; g.stream.fragment = 9; g.stream.len = sizeof wrong_protocol - 1;
+        d2k_ver_result r = {0}; char err[200] = "";
+        r.level = D2K_VER_HANDSHAKE;
+        request_page_budget(gateway_read, gateway_write, &g, "kws2.example.test", 2, NULL,
+                            60, 0, NULL, 0, &r, err, sizeof err);
+        if (r.handshake_proof || r.websocket_upgrade_proof) {
+            fprintf(stderr, "KWS accepted the wrong WebSocket subprotocol\n"); fails++;
+        }
+        static const char root404[] = "HTTP/1.1 404 Not Found\r\nContent-Length: 3\r\n\r\nno!";
+        memset(&g, 0, sizeof g);
+        g.stream.reply = root404; g.stream.fragment = 7; g.stream.len = sizeof root404 - 1;
+        memset(&r, 0, sizeof r); r.level = D2K_VER_HANDSHAKE; err[0] = '\0';
+        request_page_budget(gateway_read, gateway_write, &g, "kws2.example.test", 2, NULL,
+                            60, 0, NULL, D2K_BUDGET_FIELD_PACKETS, &r, err, sizeof err);
+        if (r.level != D2K_VER_HANDSHAKE || r.status != 404 ||
+            r.budget != D2K_BUDGET_NOT_APPLICABLE ||
+            !strstr(g.request, "GET /apiws HTTP/1.1")) {
+            fprintf(stderr, "KWS 404 incorrectly became a root/app response: level %d status %d budget %d [%s]\n",
+                    r.level, r.status, r.budget, r.reason); fails++;
+        }
+        memset(&g, 0, sizeof g);
+        g.stream.reply = root404; g.stream.fragment = 7; g.stream.len = sizeof root404 - 1;
+        memset(&r, 0, sizeof r); r.level = D2K_VER_HANDSHAKE; err[0] = '\0';
+        request_page_budget(gateway_read, gateway_write, &g, "kws2x.example.test", 2, NULL,
+                            60, 0, NULL, 0, &r, err, sizeof err);
+        if (r.status != 404 || !strstr(g.request, "GET / HTTP/1.1") ||
+            strstr(g.request, "Upgrade: websocket") || r.handshake_proof ||
+            r.websocket_upgrade_proof) {
+            fprintf(stderr, "non-KWS host incorrectly used the KWS probe\n"); fails++;
+        }
+    }
     /* (3) Keep-alive не дают: Connection: close в ответе, либо сервер закрыл
        поток после первого ответа — «не применимо», уровень прежний. */
     {

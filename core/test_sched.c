@@ -385,6 +385,7 @@ static int ver_budget_n;
 static unsigned ver_budget_seen[8];
 static int ver_budget_status = 200;
 static int ver_fail_after; /* обращения после этого номера — без приложения (0 — нет) */
+static int ver_websocket_upgrade;
 
 static d2k_ver_result stub_ver(int use_fd, const char *ip, uint16_t port, uint8_t transport,
                                const char *sni, int deadline_ms, size_t hello_wire,
@@ -425,6 +426,7 @@ static d2k_ver_result stub_ver(int use_fd, const char *ip, uint16_t port, uint8_
                (ver_fail_after && ver_calls > ver_fail_after) ||
                (ver_app_after_tcp_search && tcp_calls == 0))
                   ? D2K_VER_HANDSHAKE : ver_answer;
+    r.websocket_upgrade_proof = ver_websocket_upgrade && r.level == D2K_VER_HANDSHAKE;
     r.status = (r.level == D2K_VER_APPLICATION) ? 200 : 0;
     r.local_limit = r.level == D2K_VER_APPLICATION ? 0 : ver_local_limit;
     if (ver_calls >= 1 && ver_calls <= 8) ver_budget_seen[ver_calls - 1] = d2k_verify_budget_get();
@@ -1972,6 +1974,38 @@ static void confirm_once(d2k_catalog *cat, int link_fd, const char *target,
     confirm_transport(cat, link_fd, target, cport, 6);
 }
 
+static void test_kws_upgrade_proof(int link_fd) {
+    const char *target = "kws2.example.test";
+    d2k_catalog c = {0};
+    tcp_answer = D2K_V_PREFIX; tcp_owns_search = tcp_found_arm = 0;
+    ver_answer = D2K_VER_HANDSHAKE; ver_fail_first = ver_fail_after = 0;
+    ver_websocket_upgrade = 1;
+    vol_answer = D2K_VOL_PASSED; vol_rx_cut = 0;
+    d2k_sched *s = d2k_sched_new(&c, link_fd, 0x2d);
+    saidbuf[0] = '\0';
+    d2k_sched_set_say(s, collect_say, NULL);
+    ver_answer_port = 42501; ver_calls = 0;
+    drain(); forget_sent();
+    d2k_ev h = ev_hello(6, 42501, target); d2k_sched_event(s, &h);
+    d2k_ev sh;
+    CHECK(tls_shape_event(&sh, target, D2K_SHAPE_MODERN) == 0,
+          "KWS scheduler fixture could not build the client's TLS shape");
+    shape_same_flow(&sh, &h); d2k_sched_event(s, &sh);
+    d2k_ev su = ev_suspect(6, 42501); d2k_sched_event(s, &su);
+    settle(s);
+    d2k_ev ap = ev_applied(6, 42501); d2k_sched_event(s, &ap);
+    spin(s, 40);
+    const d2k_cat_binding *bd = binding_of(&c, target, 6);
+    CHECK(said("KWS WebSocket 101 на /apiws") && said("MTProto не проверен"),
+          "KWS confirmation did not keep the Telegram proof boundary explicit");
+    CHECK(bd && bd->verified_by == D2K_VERBY_PROBE_HANDSHAKE,
+          "KWS WebSocket proof was not recorded as a probe handshake");
+    d2k_sched_free(s);
+    ver_websocket_upgrade = 0;
+    tcp_answer = D2K_V_OPAQUE;
+    d2k_catalog_free(&c);
+}
+
 /* Задача 54: нейтральный байт перепроверки мёртвого адреса. */
 static int ack_calls;
 static int ack_answer;
@@ -2269,8 +2303,9 @@ int main(int argc, char **argv) {
     int client_tcp_only = argc == 2 && strcmp(argv[1], "--client-tcp-only") == 0;
     int ech_only = argc == 2 && strcmp(argv[1], "--ech-only") == 0;
     int clean_hs_only = argc == 2 && strcmp(argv[1], "--clean-hs-multi-client-only") == 0;
-    if (argc > 1 && !voice_only && !rx_only && !rst_only && !admission_only && !question_only && !shape_only && !groups_only && !retire_only && !recheck_only && !lifecycle_only && !own_first_only && !own_first_profile_only && !measured_only && !unfit_only && !client_tcp_only && !ech_only && !clean_hs_only) {
-        fprintf(stderr, "usage: test_sched [--voice-only|--rst-only|--admission-only|--question-only|--retire-only|--recheck-only|--lifecycle-only|--own-first-only|--own-first-profile-only|--measured-only|--ech-only|--clean-hs-multi-client-only]\n");
+    int kws_only = argc == 2 && strcmp(argv[1], "--kws-only") == 0;
+    if (argc > 1 && !voice_only && !rx_only && !rst_only && !admission_only && !question_only && !shape_only && !groups_only && !retire_only && !recheck_only && !lifecycle_only && !own_first_only && !own_first_profile_only && !measured_only && !unfit_only && !client_tcp_only && !ech_only && !clean_hs_only && !kws_only) {
+        fprintf(stderr, "usage: test_sched [--voice-only|--rst-only|--admission-only|--question-only|--retire-only|--recheck-only|--lifecycle-only|--own-first-only|--own-first-profile-only|--measured-only|--ech-only|--clean-hs-multi-client-only|--kws-only]\n");
         return 2;
     }
     /* Real default verifier, before replacing hooks: the Plan is scoped to
@@ -2322,6 +2357,12 @@ int main(int argc, char **argv) {
     {
         int fl = fcntl(drain_fd, F_GETFL, 0);
     if (fl >= 0) { (void)fcntl(drain_fd, F_SETFL, fl | O_NONBLOCK); }
+    }
+
+    if (kws_only) {
+        test_kws_upgrade_proof(sv[0]);
+        close(sv[0]); close(sv[1]);
+        return fails ? 1 : 0;
     }
 
     if (clean_hs_only) {

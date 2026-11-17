@@ -130,6 +130,9 @@ typedef struct {
        прикладной уровень НЕ ИЗМЕРЕН: HTTP-запрос на чужом языке ничего не
        доказал бы. Это не D2K_VER_APPLICATION и за него не выдаётся. */
     int      handshake_proof;
+    /* A KWS target returned a validated WebSocket 101 upgrade. This proves
+       the transport route, not a Telegram MTProto response. */
+    int      websocket_upgrade_proof;
     /* ПОВТОР ECH-ПРИВЕТСТВИЯ КЛИЕНТА (d2k_verify_replay_on): снятые байты
        клиента ушли со своего сокета, и сервер ответил ServerHello (или
        HelloRetryRequest) — то есть ровно вход коробки прошёл её на проводе.

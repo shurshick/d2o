@@ -9824,7 +9824,8 @@ static void verify_confirm(d2k_sched *s, task *t, int64_t now_ms) {
                          t->transport, t->family, rec_shape,
                          t->transport == 6 ? t->trigger_tcp_profile : D2K_TCP_PROFILE_UNKNOWN,
                          t->ver.replay_proof ? D2K_VERBY_REPLAY_HANDSHAKE :
-                         t->ver.handshake_proof ? D2K_VERBY_PROBE_HANDSHAKE
+                         (t->ver.handshake_proof || t->ver.websocket_upgrade_proof)
+                             ? D2K_VERBY_PROBE_HANDSHAKE
                                                 : D2K_VERBY_PROBE, rec_input,
                          /* Перенос не меняет отпечаток коробки плана: цель
                             этой коробкой не измерялась (задача 32, I1). */
@@ -9948,6 +9949,10 @@ static void verify_confirm(d2k_sched *s, task *t, int64_t now_ms) {
                "рукопожатия: %s (путь: %s) — ServerHello под планом (план применён к потоку "
                "зонда); без ключей клиента прикладной уровень не измерен",
             t->name, plan_id, candidate_path(t));
+    else if (t->ver.websocket_upgrade_proof)
+        say(s, "по %s (TCP) ПОДТВЕРЖДЕНО собственным зондом: KWS WebSocket 101 на "
+               "/apiws (план применён к потоку зонда); MTProto не проверен",
+            t->name);
     else if (t->ver.handshake_proof)
         say(s, "по %s (TCP) ПОДТВЕРЖДЕНО собственным зондом на уровне рукопожатия: %s "
                "(путь: %s) — TLS с ALPN клиента завершён (план применён к потоку зонда); "
@@ -9978,6 +9983,7 @@ static void verify_confirm(d2k_sched *s, task *t, int64_t now_ms) {
             t->name, t->ver.budget_packets, t->ver.budget_need, t->budget_pk, t->budget_src);
     else
         say(s, "по %s бюджет потока не проверялся (%s)", t->name,
+            t->ver.websocket_upgrade_proof ? "MTProto не проверен после WebSocket upgrade" :
             t->ver.handshake_proof ? "протокол клиента не HTTP" : "проверку не просили");
     if (!t->partial_finishing) t->partial_valid = 0; /* поиск кончился полным обходом */
     if (transferred && t->bound_plan_id[0] && !strcmp(t->bound_plan_id, plan_id) &&
@@ -12321,7 +12327,8 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                 moved++;
                 continue;
             }
-            if (!t->ver.handshake_proof && !t->ver.replay_proof &&
+            if (!t->ver.handshake_proof && !t->ver.websocket_upgrade_proof &&
+                !t->ver.replay_proof &&
                 layered_rx_result(s, t, now_ms)) { moved++; continue; }
             if (t->ver.level == D2K_VER_APPLICATION && t->ver.budget == D2K_BUDGET_CUT) {
                 /* ОБРЫВ ПОСРЕДИ ПОВТОРОВ — улика, только если план исполнился на
@@ -12353,14 +12360,14 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                 moved++;
                 continue;
             }
-            /* Доказательство на проводе: полный HTTP-ответ — либо, для
-               не-HTTP протокола клиента, завершённое рукопожатие с его ALPN
-               (задача 37, F3). Второе — уровень рукопожатия, не приложения. */
+            /* Доказательство на проводе: полный HTTP-ответ, валидный KWS
+               WebSocket Upgrade или, для не-HTTP ALPN, завершённое TLS-рукопожатие. */
             /* Повтор ECH-приветствия клиента без свидетеля (поле 04.10) —
                ServerHello на те же байты под планом: тоже граница
                рукопожатия, и слабее предыдущей (своё рукопожатие не
                завершено); verify_confirm так его и записывает. */
             int wire_proof = t->ver.level == D2K_VER_APPLICATION ||
+                (t->ver.websocket_upgrade_proof && t->ver.level == D2K_VER_HANDSHAKE) ||
                 ((t->ver.handshake_proof || t->ver.replay_proof) &&
                  t->ver.level == D2K_VER_HANDSHAKE);
             if (!wire_proof) {
@@ -12523,6 +12530,10 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                     else if (t->ver.handshake_proof)
                         say(s, "по %s рукопожатие с ALPN клиента завершено с местного порта %u "
                                "— жду применения плана к его потоку",
+                            t->name, (unsigned)t->ver.local_port);
+                    else if (t->ver.websocket_upgrade_proof)
+                        say(s, "по %s WebSocket 101 получен с местного порта %u — жду применения "
+                               "плана к его потоку; MTProto не измерен",
                             t->name, (unsigned)t->ver.local_port);
                     else if (t->ver.dns_reply)
                         say(s, "по %s %s с местного порта %u — жду применения плана к потоку",

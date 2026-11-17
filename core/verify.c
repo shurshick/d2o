@@ -915,6 +915,21 @@ static int gateway_connection_upgrade(const char *value) {
     return 0;
 }
 
+static int telegram_kws_host(const char *host) {
+    /* route_plan.c generates kws<dc>[-1].<domain> for direct KWS routes. */
+    if (!host || strncasecmp(host, "kws", 3)) return 0;
+    const unsigned char *p = (const unsigned char *)host + 3;
+    if (*p < '1' || *p > '9') return 0;
+    unsigned digits = 0;
+    while (*p >= '0' && *p <= '9') { p++; digits++; }
+    if (digits > 3) return 0;
+    if (*p == '-') {
+        if (p[1] != '1') return 0;
+        p += 2;
+    }
+    return *p == '.' && p[1] != '\0';
+}
+
 static int gateway_json_hello(const uint8_t *json, size_t len, int *opcode) {
     size_t i = 0;
     int depth = 0;
@@ -984,13 +999,13 @@ static int gateway_fill(read_fn rd, void *sess, uint8_t *buf, size_t cap,
         }
         int64_t left = until - verify_now_ms();
         if (left <= 0) {
-            snprintf(err, errcap, "тайм-аут WebSocket Gateway");
+            snprintf(err, errcap, "тайм-аут WebSocket");
             return -1;
         }
         err[0] = '\0';
         long got = rd(sess, buf + *used, cap - *used, (int)left, err, errcap);
         if (got <= 0) {
-            if (!err[0]) snprintf(err, errcap, "Gateway закрыл WebSocket до Hello");
+            if (!err[0]) snprintf(err, errcap, "сервер закрыл WebSocket до ответа приложения");
             return -1;
         }
         *used += (size_t)got;
@@ -998,11 +1013,12 @@ static int gateway_fill(read_fn rd, void *sess, uint8_t *buf, size_t cap,
     return 0;
 }
 
-static void request_gateway_websocket(read_fn rd, write_fn wr, void *sess,
-                                      int deadline_ms, d2k_ver_result *r,
-                                      char *err, size_t errcap) {
+static void request_websocket_probe(read_fn rd, write_fn wr, void *sess,
+                                    const char *host, int telegram_kws,
+                                    int deadline_ms, d2k_ver_result *r,
+                                    char *err, size_t errcap) {
     /* shortcut: fixed RFC nonce; use per-probe randomness if a gateway rejects repeated probes. */
-    static const char request[] =
+    static const char discord_request[] =
         "GET /?v=10&encoding=json HTTP/1.1\r\n"
         "Host: gateway.discord.gg\r\n"
         "User-Agent: Mozilla/5.0\r\n"
@@ -1012,17 +1028,41 @@ static void request_gateway_websocket(read_fn rd, write_fn wr, void *sess,
         "Sec-WebSocket-Version: 13\r\n"
         "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n";
     static const char expected_accept[] = "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=";
-    /* shortcut: 4 KiB Gateway cap; raise it if a real header or Hello exceeds it. */
+    char request[2048];
+    int request_len;
+    if (telegram_kws) {
+        if (!host || strpbrk(host, "\r\n")) {
+            snprintf(r->reason, sizeof r->reason, "неверное имя KWS WebSocket-цели");
+            return;
+        }
+        request_len = snprintf(request, sizeof request,
+            "GET /apiws HTTP/1.1\r\nHost: %s\r\n"
+            "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+            "Sec-WebSocket-Version: 13\r\nSec-WebSocket-Protocol: binary\r\n"
+            "Origin: https://web.telegram.org\r\n"
+            "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36\r\n\r\n", host);
+    } else {
+        request_len = snprintf(request, sizeof request, "%s", discord_request);
+    }
+    if (request_len <= 0 || (size_t)request_len >= sizeof request) {
+        snprintf(r->reason, sizeof r->reason, "WebSocket-запрос слишком длинный");
+        return;
+    }
+    /* shortcut: 4 KiB WebSocket response cap; raise it if a real response exceeds it. */
     uint8_t buf[4096];
     size_t used = 0;
     size_t header_end;
     int code = 0, upgrade_count = 0, accept_count = 0, connection_upgrade = 0;
+    int protocol_count = 0;
     r->level = D2K_VER_HANDSHAKE;
     r->budget_requests = 1;
     budget_say(r, D2K_BUDGET_NOT_APPLICABLE,
-               "Gateway WebSocket: HTTP keep-alive budget is not applicable");
+               "%s WebSocket: HTTP keep-alive budget is not applicable",
+               telegram_kws ? "KWS" : "Gateway");
     err[0] = '\0';
-    if (wr(sess, (const uint8_t *)request, sizeof request - 1, err, errcap) != 0) {
+    if (wr(sess, (const uint8_t *)request, (size_t)request_len, err, errcap) != 0) {
         snprintf(r->reason, sizeof r->reason, "WebSocket-запрос не ушёл: %.120s", err);
         return;
     }
@@ -1037,18 +1077,18 @@ static void request_gateway_websocket(read_fn rd, write_fn wr, void *sess,
     while (status_end + 1 < header_end &&
            !(buf[status_end] == '\r' && buf[status_end + 1] == '\n')) status_end++;
     if (status_end + 1 >= header_end || status_end >= 128) {
-        snprintf(r->reason, sizeof r->reason, "битая строка статуса WebSocket Gateway");
+        snprintf(r->reason, sizeof r->reason, "битая строка статуса WebSocket");
         return;
     }
     buf[status_end] = '\0';
     if (sscanf((char *)buf, "HTTP/1.1 %d", &code) != 1 || code < 100 || code > 599) {
-        snprintf(r->reason, sizeof r->reason, "битая строка статуса WebSocket Gateway");
+        snprintf(r->reason, sizeof r->reason, "битая строка статуса WebSocket");
         return;
     }
     r->status = code;
     if (code != 101) {
-        snprintf(r->reason, sizeof r->reason,
-                 "Gateway ответил HTTP %d без WebSocket Upgrade", code);
+        snprintf(r->reason, sizeof r->reason, "%s ответил HTTP %d без WebSocket Upgrade",
+                 telegram_kws ? "KWS" : "Gateway", code);
         return;
     }
     for (size_t pos = status_end + 2; pos < header_end; ) {
@@ -1066,12 +1106,23 @@ static void request_gateway_websocket(read_fn rd, write_fn wr, void *sess,
         } else if ((value = gateway_header_value(line, "Sec-WebSocket-Accept")) != NULL) {
             accept_count++;
             if (strcmp(value, expected_accept)) accept_count = 2;
+        } else if ((value = gateway_header_value(line, "Sec-WebSocket-Protocol")) != NULL) {
+            protocol_count++;
+            if (strcmp(value, "binary")) protocol_count = 2;
         }
         pos = end + 2;
     }
-    if (upgrade_count != 1 || !connection_upgrade || accept_count != 1) {
+    if (upgrade_count != 1 || !connection_upgrade || accept_count != 1 ||
+        (telegram_kws && protocol_count != 1)) {
         snprintf(r->reason, sizeof r->reason,
-                 "Gateway 101 не подтвердил WebSocket Upgrade");
+                 "%s 101 не подтвердил WebSocket Upgrade",
+                 telegram_kws ? "KWS" : "Gateway");
+        return;
+    }
+    if (telegram_kws) {
+        r->websocket_upgrade_proof = 1;
+        snprintf(r->http_evidence, sizeof r->http_evidence, "KWS WebSocket 101 /apiws");
+        snprintf(r->reason, sizeof r->reason, "KWS WebSocket upgrade принят; MTProto не проверен");
         return;
     }
     size_t frame = header_end + 4;
@@ -1252,7 +1303,11 @@ static void request_page_budget(read_fn rd, write_fn wr, void *sess,
                                 const budget_io *io, unsigned budget,
                                 d2k_ver_result *r, char *err, size_t errcap) {
     if (!initial_path && host && !strcasecmp(host, "gateway.discord.gg")) {
-        request_gateway_websocket(rd, wr, sess, deadline_ms, r, err, errcap);
+        request_websocket_probe(rd, wr, sess, host, 0, deadline_ms, r, err, errcap);
+        return;
+    }
+    if (telegram_kws_host(host)) {
+        request_websocket_probe(rd, wr, sess, host, 1, deadline_ms, r, err, errcap);
         return;
     }
     char path[1024] = "/";
