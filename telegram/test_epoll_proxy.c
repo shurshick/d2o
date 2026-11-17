@@ -123,6 +123,7 @@ typedef struct {
     const char *cert_path;
     const char *key_path;
     const char *expected_sni;
+    const char *expected_host;
     const char *expected_path;
     int expect_binary_subprotocol;
     const char *required_subprotocol;
@@ -534,6 +535,12 @@ static void serve_direct_wss_connection(wss_server_fixture *fixture, int fd) {
         "GET %s HTTP/1.1\r\n", expected_path);
     assert(expected_request_len > 0 && (size_t)expected_request_len < sizeof(expected_request));
     assert(strncmp(request, expected_request, (size_t)expected_request_len) == 0);
+    const char *expected_host = fixture->expected_host
+        ? fixture->expected_host : expected_sni;
+    int host_len = snprintf(expected_request, sizeof(expected_request),
+                            "\r\nHost: %s\r\n", expected_host);
+    assert(host_len > 0 && (size_t)host_len < sizeof(expected_request));
+    assert(strstr(request, expected_request));
     if (fixture->required_subprotocol) {
         char header[128];
         assert(snprintf(header, sizeof(header), "Sec-WebSocket-Protocol: %s\r\n",
@@ -620,7 +627,8 @@ static void serve_direct_wss_connection(wss_server_fixture *fixture, int fd) {
         assert(second >= 0);
         fixture->accepted_count = 2;
         fixture->wait_for_fallback = 0;
-        fixture->expected_sni = "kws4.cfproxy.test";
+        fixture->expected_sni = "cfproxy.test";
+        fixture->expected_host = "kws4.cfproxy.test";
         fixture->expected_path = "/apiws";
         fixture->expect_binary_subprotocol = 1;
         fixture->skip_client_packet = 1;
@@ -1837,7 +1845,8 @@ static void test_epoll_hedged_wss_commits_one_route_before_payload(
                               .key_path = key_path,
                               .expect_binary_subprotocol = 1};
     atomic_init(&wss.complete, 0);
-    wss.expected_sni = adaptive ? "kws4-1.cfproxy.test" : "kws4-1.web.telegram.org";
+    wss.expected_sni = adaptive ? "cfproxy.test" : "kws4-1.web.telegram.org";
+    wss.expected_host = adaptive ? "kws4-1.cfproxy.test" : NULL;
     uint8_t handshake[64];
     make_wss_test_handshake(proto, 4, 1, handshake);
     memcpy(wss.handshake, handshake, sizeof(handshake));
@@ -2257,6 +2266,8 @@ typedef struct {
 
 static void *read_media_test_client(void *opaque);
 
+enum { PROXY_HEDGED = 1, PROXY_TLS_TIMEOUT };
+
 static void test_epoll_cf_worker_uses_raw_stream_framing(uint16_t raw_port,
                                                         int legacy_worker,
                                                         int slow_proxy, uint32_t dc,
@@ -2326,7 +2337,8 @@ static void test_epoll_cf_worker_uses_raw_stream_framing(uint16_t raw_port,
     tg_config routing = {.route_only = media_chunks ? TG_ROUTE_ONLY_WORKER : TG_ROUTE_ONLY_AUTO};
     uint16_t slow_port;
     int slow_listener = slow_proxy ? create_listener(&slow_port) : -1;
-    routing.ws_routing = slow_proxy ? TG_WS_ROUTING_ADAPTIVE : TG_WS_ROUTING_CF_FIRST;
+    routing.ws_routing = slow_proxy == PROXY_HEDGED
+        ? TG_WS_ROUTING_ADAPTIVE : TG_WS_ROUTING_CF_FIRST;
     routing.ws_hedge_delay_ms = 25;
     routing.ws_hedge_limit = 1;
     routing.cf_worker_domain_count = 1;
@@ -2341,7 +2353,7 @@ static void test_epoll_cf_worker_uses_raw_stream_framing(uint16_t raw_port,
         .memory_budget_bytes = media_chunks
             ? tg_limits_runtime_memory_budget(128u * mib, 8u * mib) : 32u * mib,
         .configured_max_connections = 8,
-        .handshake_timeout_ms = 3000,
+        .handshake_timeout_ms = slow_proxy == PROXY_TLS_TIMEOUT ? 250 : 3000,
         .idle_timeout_ms = 5000,
         .enable_direct_wss = 1,
         .cloudflare_only = 1,
@@ -2417,6 +2429,10 @@ static void test_epoll_cf_worker_uses_raw_stream_framing(uint16_t raw_port,
     }
     if (slow_proxy) {
         assert(fixture.cf_proxy_b_resolve_calls == 1);
+        if (slow_proxy == PROXY_TLS_TIMEOUT) {
+            assert(route_stats.last_failure_route == TG_ROUTE_CF_PROXY);
+            assert(route_stats.last_failure_stage == TG_EPOLL_FAILURE_TLS);
+        }
         close(slow_listener);
     }
     tg_epoll_proxy_destroy(proxy);
@@ -2573,7 +2589,8 @@ static void test_epoll_cf_proxy_preserves_media_dc_hostname_and_framing(int ios_
         .listener = create_listener(&ws_port),
         .cert_path = cert_path,
         .key_path = key_path,
-        .expected_sni = ios_prefix ? "kws2-1.cfproxy.test" : "kws203-1.cfproxy.test",
+        .expected_sni = "cfproxy.test",
+        .expected_host = ios_prefix ? "kws2-1.cfproxy.test" : "kws203-1.cfproxy.test",
         .expected_path = "/apiws",
         .expect_binary_subprotocol = 1
     };
@@ -2708,7 +2725,8 @@ static void test_epoll_reuses_confirmed_media_route_across_ips(void) {
         .listener = create_listener(&ws_port),
         .cert_path = cert_path,
         .key_path = key_path,
-        .expected_sni = "kws4-1.cfproxy-b.test",
+        .expected_sni = "cfproxy-b.test",
+        .expected_host = "kws4-1.cfproxy-b.test",
         .expected_path = "/apiws",
         .expect_binary_subprotocol = 1
     };
@@ -2891,7 +2909,8 @@ static void test_epoll_cools_down_cf_proxy_after_dns_failure(void) {
         .listener = create_listener(&a_port),
         .cert_path = cert_path,
         .key_path = key_path,
-        .expected_sni = "kws4-1.cfproxy-a.test",
+        .expected_sni = "cfproxy-a.test",
+        .expected_host = "kws4-1.cfproxy-a.test",
         .expected_path = "/apiws",
         .expect_binary_subprotocol = 1
     };
@@ -2899,7 +2918,8 @@ static void test_epoll_cools_down_cf_proxy_after_dns_failure(void) {
         .listener = create_listener(&b_port),
         .cert_path = cert_path,
         .key_path = key_path,
-        .expected_sni = "kws4-1.cfproxy-b.test",
+        .expected_sni = "cfproxy-b.test",
+        .expected_host = "kws4-1.cfproxy-b.test",
         .expected_path = "/apiws",
         .expect_binary_subprotocol = 1,
         .response_delay_ms = 80
@@ -3033,7 +3053,8 @@ static void test_wss_partial_frame_before_response_advances_route(void) {
         .listener = create_listener(&ws_port),
         .cert_path = cert_path,
         .key_path = key_path,
-        .expected_sni = "kws4-1.cfproxy.test",
+        .expected_sni = "cfproxy.test",
+        .expected_host = "kws4-1.cfproxy.test",
         .expected_path = "/apiws",
         .expect_binary_subprotocol = 1,
         .wait_for_fallback = 1,
@@ -3636,7 +3657,7 @@ static int resolve_memory_test_route(void *opaque, const char *hostname,
     if (fixture->fail_dc4_proxy && strcmp(hostname, "kws4.cfproxy.test") == 0)
         return -1;
     for (size_t i = 0; i < 4; ++i) {
-        if (strcmp(hostname, fixture->upstream[i].expected_sni) == 0) {
+        if (strcmp(hostname, fixture->upstream[i].expected_host) == 0) {
             *out = fixture->targets[i];
             return 0;
         }
@@ -3691,7 +3712,7 @@ static void test_media_after_low_memory_start(size_t media_chunks) {
     EVP_PKEY_free(key);
 
     memory_recovery_fixture fixture = {0};
-    static const char *const sni[] = {
+    static const char *const hosts[] = {
         "kws4.cfproxy.test", "kws2.cfproxy.test", "kws2-1.cfproxy.test", "worker.test"
     };
     static const uint32_t dc[] = {4, 2, 2, 4};
@@ -3703,7 +3724,8 @@ static void test_media_after_low_memory_start(size_t media_chunks) {
         upstream->listener = create_listener(&port);
         upstream->cert_path = cert_path;
         upstream->key_path = key_path;
-        upstream->expected_sni = sni[i];
+        upstream->expected_sni = i == 3 ? hosts[i] : "cfproxy.test";
+        upstream->expected_host = hosts[i];
         upstream->expected_path = i == 3
             ? "/apiws?dst=149.154.167.51&dc=4&media=1" : "/apiws";
         upstream->expect_binary_subprotocol = i != 3;
@@ -3925,7 +3947,10 @@ int main(int argc, char **argv) {
      * Worker upgrade unchanged, including when Proxy is attempted first. */
     test_epoll_cf_worker_uses_raw_stream_framing(0, 0, 0, 2, "149.154.167.50", 0, 0);
     test_epoll_cf_worker_uses_raw_stream_framing(0, 0, 0, 2, "149.154.167.151", 1, 0);
-    test_epoll_cf_worker_uses_raw_stream_framing(0, 0, 1, 4, "149.154.167.43", 1, 0);
+    test_epoll_cf_worker_uses_raw_stream_framing(0, 0, PROXY_HEDGED, 4,
+                                                "149.154.167.43", 1, 0);
+    test_epoll_cf_worker_uses_raw_stream_framing(0, 0, PROXY_TLS_TIMEOUT, 4,
+                                                "149.154.167.91", 0, 0);
     test_epoll_cf_worker_uses_raw_stream_framing(0, 0, 0, 4, "2001:67c:4e8:f004::a", 0, 0);
     test_epoll_cf_worker_uses_raw_stream_framing(443, 0, 0, 4, "149.154.167.51", 1, 0);
     test_epoll_cf_worker_uses_raw_stream_framing(5222, 0, 0, 4, "149.154.167.51", 1, 0);

@@ -24,6 +24,8 @@ typedef struct {
 typedef struct {
     int listener;
     SSL_CTX *context;
+    int worker;
+    int wrong_hostname;
 } fake_wss;
 
 static void read_all(int fd, uint8_t *data, size_t len) {
@@ -92,7 +94,7 @@ static X509 *make_wss_test_cert(EVP_PKEY *key) {
     assert(extension && X509_add_ext(cert, extension, -1) == 1);
     X509_EXTENSION_free(extension);
     extension = X509V3_EXT_conf_nid(NULL, NULL, NID_subject_alt_name,
-                                    "DNS:worker.example");
+                                    "DNS:worker.example,DNS:kws2.pool.example");
     assert(extension && X509_add_ext(cert, extension, -1) == 1);
     X509_EXTENSION_free(extension);
     assert(X509_sign(cert, key, EVP_sha256()) > 0);
@@ -143,9 +145,17 @@ static void *serve_wss_discovery_request(void *opaque) {
     int fd = accept(fake->listener, NULL, NULL);
     assert(fd >= 0);
     SSL *ssl = SSL_new(fake->context);
-    assert(ssl && SSL_set_fd(ssl, fd) == 1 && SSL_accept(ssl) == 1);
+    assert(ssl && SSL_set_fd(ssl, fd) == 1);
+    int accepted = SSL_accept(ssl);
     const char *sni = SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name);
-    assert(sni && strcmp(sni, "worker.example") == 0);
+    assert(sni && strcmp(sni, fake->worker ? "worker.example" : "pool.example") == 0);
+    if (fake->wrong_hostname) {
+        assert(accepted != 1);
+        SSL_free(ssl);
+        close(fd);
+        return NULL;
+    }
+    assert(accepted == 1);
 
     char request[2048] = {0};
     size_t used = 0;
@@ -155,10 +165,15 @@ static void *serve_wss_discovery_request(void *opaque) {
         ++used;
         request[used] = '\0';
     }
-    assert(strstr(request,
-        "GET /apiws?dst=149.154.175.50&dc=1&media=0 HTTP/1.1\r\n") != NULL);
-    assert(strstr(request, "Host: worker.example\r\n") != NULL);
-    assert(strstr(request, "Sec-WebSocket-Protocol:") == NULL);
+    assert(strstr(request, fake->worker
+        ? "GET /apiws?dst=149.154.175.50&dc=1&media=0 HTTP/1.1\r\n"
+        : "GET /apiws HTTP/1.1\r\n"));
+    assert(strstr(request, fake->worker
+        ? "Host: worker.example\r\n" : "Host: kws2.pool.example\r\n"));
+    if (fake->worker)
+        assert(!strstr(request, "Sec-WebSocket-Protocol:"));
+    else
+        assert(strstr(request, "Sec-WebSocket-Protocol: binary\r\n"));
     const char *key_line = strstr(request, "Sec-WebSocket-Key: ");
     assert(key_line);
     key_line += strlen("Sec-WebSocket-Key: ");
@@ -181,7 +196,8 @@ static void *serve_wss_discovery_request(void *opaque) {
     int response_len = snprintf(response, sizeof(response),
         "HTTP/1.1 101 Switching Protocols\r\n"
         "Upgrade: websocket\r\nConnection: Upgrade\r\n"
-        "Sec-WebSocket-Accept: %s\r\n\r\n", accept_key);
+        "Sec-WebSocket-Accept: %s\r\n%s\r\n", accept_key,
+        fake->worker ? "" : "Sec-WebSocket-Protocol: binary\r\n");
     assert(response_len > 0 && (size_t)response_len < sizeof(response));
     ssl_write_all(ssl, (const uint8_t *)response, (size_t)response_len);
 
@@ -189,7 +205,8 @@ static void *serve_wss_discovery_request(void *opaque) {
     size_t frame_len = read_client_ws_binary(ssl, frame, sizeof(frame));
     assert(frame_len == TG_MTPROTO_HANDSHAKE_LEN);
     tg_mtproto_init init;
-    assert(tg_mtproto_parse_obfuscated2(frame, &init) == 0 && init.dc_id == 1);
+    assert(tg_mtproto_parse_obfuscated2(frame, &init) == 0 &&
+           init.dc_id == (fake->worker ? 1u : 2u));
     frame_len = read_client_ws_binary(ssl, frame, sizeof(frame));
     assert(frame_len == 4);
     frame_len = read_client_ws_binary(ssl, frame, sizeof(frame));
@@ -357,17 +374,19 @@ static void test_config_discovery_rejects_invalid_arguments(void) {
                                       &snapshot) != 0);
     snapshot.this_dc = 77;
     assert(tg_mtproto_discover_config_wss(NULL, "127.0.0.1",
-                                          "worker.example", "/apiws", 1, 443, 1,
+                                          "worker.example", "worker.example",
+                                          "/apiws", 1, 443, 1,
                                           1000, 0, 1, &snapshot) != 0);
     assert(snapshot.this_dc == 0 && snapshot.endpoint_count == 0);
     snapshot.this_dc = 77;
-    assert(tg_mtproto_discover_config_wss(NULL, NULL, "worker.example",
+    assert(tg_mtproto_discover_config_wss(NULL, NULL, "worker.example", "worker.example",
                                           "/apiws", 1, 443, 1, 1000, 0, 1,
                                           &snapshot) != 0);
     assert(snapshot.this_dc == 0 && snapshot.endpoint_count == 0);
 }
 
-static void test_wss_discovery_authenticates_host_and_forwards_binary_stream(void) {
+static void test_wss_discovery_authenticates_host_and_forwards_binary_stream(
+    int worker, int wrong_hostname) {
     uint16_t port = 0;
     EVP_PKEY *key = make_wss_test_key();
     X509 *cert = make_wss_test_cert(key);
@@ -380,14 +399,20 @@ static void test_wss_discovery_authenticates_host_and_forwards_binary_stream(voi
     SSL_CTX_set_verify(client_context, SSL_VERIFY_PEER, NULL);
     fake_wss fake = {
         .listener = create_wss_listener(&port),
-        .context = server_context
+        .context = server_context,
+        .worker = worker,
+        .wrong_hostname = wrong_hostname
     };
     pthread_t thread;
     assert(pthread_create(&thread, NULL, serve_wss_discovery_request, &fake) == 0);
     tg_dc_snapshot snapshot = {.this_dc = 77};
+    const char *hostname = worker ? "worker.example" : wrong_hostname
+        ? "kws4.pool.example" : "kws2.pool.example";
+    const char *sni = worker ? hostname : "pool.example";
+    const char *path = worker ? "/apiws?dst=149.154.175.50&dc=1&media=0" : "/apiws";
     assert(tg_mtproto_discover_config_wss(
-        client_context, "127.0.0.1", "worker.example",
-        "/apiws?dst=149.154.175.50&dc=1&media=0", 1, port, 1, 5000, 0,
+        client_context, "127.0.0.1", hostname, sni, path,
+        worker, port, worker ? 1u : wrong_hostname ? 4u : 2u, 5000, 0,
         (int64_t)time(NULL), &snapshot) != 0);
     assert(snapshot.this_dc == 0 && snapshot.endpoint_count == 0);
     assert(pthread_join(thread, NULL) == 0);
@@ -487,13 +512,13 @@ static void test_encrypted_response_ignores_control_messages_before_rpc_result(v
 
 static void test_wss_probe_rejects_invalid_configuration(void) {
     tg_mtproto_probe_result result = {0};
-    assert(tg_mtproto_probe_res_pq_wss(NULL, "localhost", 1, 0, 1000,
+    assert(tg_mtproto_probe_res_pq_wss(NULL, "localhost", "localhost", 1, 0, 1000,
                                        &result) == TG_MTPROTO_PROBE_INVALID);
     assert(result.stage == TG_MTPROTO_PROBE_STAGE_INPUT);
     assert(result.error == TG_MTPROTO_PROBE_ERROR_INVALID_INPUT);
-    assert(tg_mtproto_probe_res_pq_wss(NULL, NULL, 1, 0, 1000,
+    assert(tg_mtproto_probe_res_pq_wss(NULL, NULL, "localhost", 1, 0, 1000,
                                        &result) == TG_MTPROTO_PROBE_INVALID);
-    assert(tg_mtproto_probe_res_pq_wss(NULL, "localhost", 6, 0, 1000,
+    assert(tg_mtproto_probe_res_pq_wss(NULL, "localhost", "localhost", 6, 0, 1000,
                                        &result) == TG_MTPROTO_PROBE_INVALID);
 }
 
@@ -503,7 +528,9 @@ int main(void) {
     test_response_with_wrong_nonce_is_not_healthy();
     test_non_plain_response_is_not_healthy();
     test_config_discovery_rejects_invalid_arguments();
-    test_wss_discovery_authenticates_host_and_forwards_binary_stream();
+    test_wss_discovery_authenticates_host_and_forwards_binary_stream(1, 0);
+    test_wss_discovery_authenticates_host_and_forwards_binary_stream(0, 0);
+    test_wss_discovery_authenticates_host_and_forwards_binary_stream(0, 1);
     test_encrypted_response_ignores_control_messages_before_rpc_result();
     puts("Тесты MTProto probe и response parser: ок");
     return 0;

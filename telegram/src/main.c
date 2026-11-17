@@ -145,7 +145,8 @@ static int discovery_cancelled(const atomic_int *cancelled,
 }
 
 static int discover_wss_host(SSL_CTX *tls_context, tg_route_dns *route_dns,
-                             const char *hostname, const char *path, int worker,
+                             const char *hostname, const char *sni,
+                             const char *path, int worker,
                              uint32_t dc_id, int64_t now,
                              const atomic_int *cancelled, uint64_t deadline,
                              tg_dc_snapshot *snapshot) {
@@ -190,7 +191,7 @@ static int discover_wss_host(SSL_CTX *tls_context, tg_route_dns *route_dns,
         uint32_t timeout = remaining < TG_DC_DISCOVERY_TIMEOUT_MS
             ? (uint32_t)remaining : TG_DC_DISCOVERY_TIMEOUT_MS;
         if (tg_mtproto_discover_config_wss(
-                tls_context, numeric_address, hostname, path, worker, 443, dc_id,
+                tls_context, numeric_address, hostname, sni, path, worker, 443, dc_id,
                 timeout, TG_OUTBOUND_SOCKET_MARK, now,
                 snapshot) == 0)
             return 0;
@@ -223,7 +224,8 @@ static int refresh_local_dc_map(const tg_config *config,
         for (size_t route = 0; route < domain_count + worker_count; ++route) {
             if (discovery_cancelled(cancelled, deadline)) return -1;
             int worker = route >= first_proxy && route < first_proxy + worker_count;
-            char hostname[TG_CF_DOMAIN_LEN + 16u];
+            char hostname[TG_CF_DOMAIN_LEN], domain[TG_CF_DOMAIN_LEN];
+            const char *sni = hostname;
             char path[128] = "/apiws";
             if (worker) {
                 snprintf(hostname, sizeof(hostname), "%s",
@@ -233,13 +235,13 @@ static int refresh_local_dc_map(const tg_config *config,
                 if (n <= 0 || (size_t)n >= sizeof(path)) continue;
             } else {
                 size_t index = route == 0 ? 0 : route - worker_count;
-                char domain[TG_CF_DOMAIN_LEN];
                 if (tg_cf_domain_pool_copy_at(cf_domains, index, domain) != 0 ||
                     tg_route_cf_proxy_hostname(dc_id, 0, domain, hostname,
                                                sizeof(hostname)) != 0)
                     continue;
+                sni = domain;
             }
-            if (discover_wss_host(tls_context, route_dns, hostname, path, worker,
+            if (discover_wss_host(tls_context, route_dns, hostname, sni, path, worker,
                     dc_id, now, cancelled, deadline, snapshot) == 0)
                 return 0;
         }

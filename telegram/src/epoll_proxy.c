@@ -112,6 +112,7 @@ struct proxy_connection {
     tg_mtproto_proto wss_proto;
     tg_route_plan route_plan;
     char tls_hostname[TG_CF_DOMAIN_LEN];
+    uint8_t cf_base_offset;
     char wss_path[512];
     tg_route_kind route_kind;
     int wss_phase;
@@ -1634,9 +1635,12 @@ static int attach_pooled_worker(proxy_connection *connection,
 static int prepare_wss_tls(proxy_connection *connection) {
     tg_epoll_proxy *server = connection->server;
     if (!server->config.tls_context || !connection->tls_hostname[0]) return -1;
+    const char *sni = connection->tls_hostname;
+    if (connection->route_kind == TG_ROUTE_CF_PROXY)
+        sni += connection->cf_base_offset;
     connection->upstream_ssl = tg_tls_prepare_client_fd(
         server->config.tls_context, connection->upstream_fd,
-        connection->tls_hostname, connection->tls_hostname);
+        connection->tls_hostname, sni);
     if (!connection->upstream_ssl) return -1;
     connection->wss_phase = WSS_TLS;
     connection->tls_want = EPOLLOUT;
@@ -1884,6 +1888,8 @@ static int setup_route_attempt(proxy_connection *connection,
                 if (cooldown) *cooldown = 1;
                 return 2;
             }
+            /* Keep the configured base suffix in the same buffer as the Host. */
+            connection->cf_base_offset = (uint8_t)(strlen(hostname) - strlen(domain_copy));
             domain = hostname;
         }
         if (!domain) return -1;
@@ -2405,6 +2411,7 @@ static int hedge_promote_candidate(proxy_connection *candidate) {
     parent->wss_deadline_ms = candidate->wss_deadline_ms;
     memcpy(parent->tls_hostname, candidate->tls_hostname,
            sizeof(parent->tls_hostname));
+    parent->cf_base_offset = candidate->cf_base_offset;
     memcpy(parent->wss_path, candidate->wss_path, sizeof(parent->wss_path));
     parent->upstream_watch = (socket_watch){
         .kind = 2, .connection = parent, .side = 1,

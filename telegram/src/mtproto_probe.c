@@ -755,7 +755,7 @@ static int wss_wait_for_res_pq(tg_ws_pump *pump, int fd,
 }
 
 tg_mtproto_probe_status tg_mtproto_probe_res_pq_wss(
-    SSL_CTX *tls_context, const char *hostname, uint32_t dc_id,
+    SSL_CTX *tls_context, const char *hostname, const char *sni, uint32_t dc_id,
     uint32_t socket_mark, uint32_t timeout_ms, tg_mtproto_probe_result *out) {
     uint8_t handshake[TG_MTPROTO_HANDSHAKE_LEN] = {0};
     uint8_t request[40] = {0}, framed_request[44] = {0};
@@ -771,7 +771,8 @@ tg_mtproto_probe_status tg_mtproto_probe_res_pq_wss(
     memset(out, 0, sizeof(*out));
     out->stage = TG_MTPROTO_PROBE_STAGE_INPUT;
     out->error = TG_MTPROTO_PROBE_ERROR_INVALID_INPUT;
-    if (!tls_context || !hostname || !*hostname || dc_id < 1 || dc_id > 5 ||
+    if (!tls_context || !hostname || !*hostname || !sni || !*sni ||
+        dc_id < 1 || dc_id > 5 ||
         timeout_ms == 0 || timeout_ms > 60000 || !started ||
         strlen(hostname) >= 256)
         goto done;
@@ -788,7 +789,7 @@ tg_mtproto_probe_status tg_mtproto_probe_res_pq_wss(
         goto done;
     }
     out->stage = TG_MTPROTO_PROBE_STAGE_TLS;
-    ssl = tg_tls_prepare_client_fd(tls_context, fd, hostname, hostname);
+    ssl = tg_tls_prepare_client_fd(tls_context, fd, hostname, sni);
     if (!ssl || ssl_handshake_until(ssl, fd, deadline) != 0) {
         error = errno == ETIMEDOUT ? TG_MTPROTO_PROBE_ERROR_TIMEOUT
                : (ssl && SSL_get_verify_result(ssl) != X509_V_OK
@@ -1275,7 +1276,8 @@ int tg_mtproto_discover_config(const char *numeric_address, uint16_t port,
 
 int tg_mtproto_discover_config_wss(SSL_CTX *tls_context,
                                    const char *numeric_address,
-                                   const char *hostname, const char *path,
+                                   const char *hostname, const char *sni,
+                                   const char *path,
                                    int worker, uint16_t port, uint32_t dc_id,
                                    uint32_t timeout_ms,
                                    uint32_t socket_mark, int64_t now,
@@ -1286,6 +1288,7 @@ int tg_mtproto_discover_config_wss(SSL_CTX *tls_context,
     int rc = -1;
     if (out) memset(out, 0, sizeof(*out));
     if (!out || !tls_context || !numeric_address || !hostname || !*hostname ||
+        !sni || !*sni ||
         strlen(hostname) >= TG_CONFIG_DOMAIN_SIZE || !path || path[0] != '/' ||
         strpbrk(hostname, "\r\n/ ") || strpbrk(path, "\r\n ") ||
         strlen(path) >= 1024u || !port || dc_id < 1 || dc_id > 999 ||
@@ -1296,7 +1299,7 @@ int tg_mtproto_discover_config_wss(SSL_CTX *tls_context,
     io.fd = connect_numeric_until(numeric_address, port, socket_mark,
                                   deadline);
     if (io.fd < 0) goto done;
-    ssl = tg_tls_prepare_client_fd(tls_context, io.fd, hostname, hostname);
+    ssl = tg_tls_prepare_client_fd(tls_context, io.fd, hostname, sni);
     if (!ssl || ssl_handshake_until(ssl, io.fd, deadline) != 0 ||
         SSL_get_verify_result(ssl) != X509_V_OK ||
         wss_upgrade_until(ssl, io.fd, hostname, path, worker, deadline) != 0)
